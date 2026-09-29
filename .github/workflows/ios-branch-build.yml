@@ -1,18 +1,27 @@
 name: Build Madeira iPhone package (branch validation)
 # Temporary: workflow_dispatch only works for workflows on the default branch, so
-# this runs the full build for pushes to the development branch. Delete once
-# the workflows are on main.
+# this runs the build for pushes to the development branch. Delete once the
+# workflows are on main.
+#
+# A head commit message containing [ci-deps:fex], [ci-deps:llvm] or
+# [ci-deps:wine] builds just that dependency; otherwise the full IPA is built.
 on:
   push:
     branches: [claude/dazzling-mccarthy-7x4b15]
     paths:
       - .github/workflows/ios-*.yml
       - scripts/ci-*.sh
-      - patches/fex-native-diagnostics.patch
+      - patches/fex-native-*.patch
       - build/**
 permissions:
   contents: read
   actions: read
 jobs:
-  build:
+  component:
+    if: ${{ contains(github.event.head_commit.message, '[ci-deps:') }}
+    uses: ./.github/workflows/ios-dependencies.yml
+    with:
+      component: ${{ contains(github.event.head_commit.message, '[ci-deps:fex]') && 'fex' || contains(github.event.head_commit.message, '[ci-deps:wine]') && 'wine' || 'llvm' }}
+  full:
+    if: ${{ !contains(github.event.head_commit.message, '[ci-deps:') }}
     uses: ./.github/workflows/ios-app.yml

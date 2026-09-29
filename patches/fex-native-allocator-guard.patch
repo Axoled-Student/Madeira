@@ -1,0 +1,12 @@
+diff --git a/FEXCore/Source/Utils/AllocatorHooks.cpp b/FEXCore/Source/Utils/AllocatorHooks.cpp
+index 8d48401..80f3b8e 100644
+--- a/FEXCore/Source/Utils/AllocatorHooks.cpp
++++ b/FEXCore/Source/Utils/AllocatorHooks.cpp
+@@ -267,7 +267,6 @@ void free(void* ptr) {
+   return ::free(ptr);
+ }
+ size_t malloc_usable_size(void* ptr) {
+-  IOS_RPM_GUARD();
+ #ifdef __APPLE__
+   return ::malloc_size(ptr);
+ #else

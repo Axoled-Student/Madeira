@@ -15,14 +15,19 @@ case "$component" in
     madeira_select_xcode
     MADEIRA_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
     git submodule update --init --depth 1 FEX
-    # The native iOS build must not compile the Windows-only diagnostics.
-    # Tolerate a FEX revision that already carries the guards.
-    if git -C FEX apply --reverse --check "$MADEIRA_ROOT/patches/fex-native-diagnostics.patch" 2>/dev/null; then
-      echo 'FEX already carries fex-native-diagnostics.patch'
-    else
-      git -C FEX apply --check "$MADEIRA_ROOT/patches/fex-native-diagnostics.patch"
-      git -C FEX apply "$MADEIRA_ROOT/patches/fex-native-diagnostics.patch"
-    fi
+    # Fixes the native iOS build needs. Tolerate a FEX revision that already
+    # carries one of them.
+    #  - diagnostics: keep the Windows-only diagnostics out of the native build.
+    #  - allocator-guard: the no-allocator branch of AllocatorHooks.cpp called a
+    #    macro that is only defined in the allocator branch.
+    for patch in fex-native-diagnostics fex-native-allocator-guard; do
+      if git -C FEX apply --reverse --check "$MADEIRA_ROOT/patches/$patch.patch" 2>/dev/null; then
+        echo "FEX already carries $patch.patch"
+      else
+        git -C FEX apply --check "$MADEIRA_ROOT/patches/$patch.patch"
+        git -C FEX apply "$MADEIRA_ROOT/patches/$patch.patch"
+      fi
+    done
     git -C FEX submodule update --init --depth 1 --jobs 3 \
       External/fmt External/xxhash External/range-v3 External/unordered_dense
     # Options of build/fex-ios/build.sh, plus what a clean hosted runner needs.
@@ -37,8 +42,9 @@ case "$component" in
       -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=OFF \
       -DENABLE_LTO=OFF -DENABLE_WERROR=OFF -DENABLE_OFFLINE_TELEMETRY=OFF \
       -DTUNE_CPU=none
+    # -k 0: keep going after a failure, so one run reports every compile error.
     cmake --build FEX/build-ios --parallel "$MADEIRA_JOBS" \
-      --target FEXCore FEXCore_Base JemallocLibs softfloat_3e
+      --target FEXCore FEXCore_Base JemallocLibs softfloat_3e -- -k 0
     # The archives app/Madeira.xcodeproj links must all be there.
     for lib in FEXCore/Source/libFEXCore.a FEXCore/Source/libFEXCore_Base.a \
                FEXCore/Source/libJemallocLibs.a External/fmt/libfmt.a \
