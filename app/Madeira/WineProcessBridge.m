@@ -987,12 +987,12 @@ static void *wine_process_thread(void *arg) {
                         setenv("MADEIRA_SWAP_MB", [NSString stringWithFormat:@"%ld", capMB].UTF8String, 1);
                         LOG("ml1077 swap tier armed: %{public}s, %ld MB", swapPath.UTF8String, capMB);
                         fprintf(stderr, "[swap] ml1077 app: backing file %s, cap %ld MB\n", swapPath.UTF8String, capMB);
-                        /* ml1150: memory pool, the tier's first stage (MemoryPool.m). */
-                        long poolMB = (long)madeira_cfg_int("mempool-mb", 0);   /* madeira.cfg mempool-mb = N */
+                        /* ml1150: donor pool, the tier's first stage (DonorPool.m). */
+                        long poolMB = (long)madeira_cfg_int("donor-pool-mb", 0);   /* madeira.cfg donor-pool-mb = N */
                         if (poolMB >= 512) {
-                            extern long MadeiraMemoryPoolStart(long megabytes);
-                            long got = MadeiraMemoryPoolStart(poolMB);
-                            LOG("ml1150 memory pool: %ld of %ld MB", got, poolMB);
+                            extern long MadeiraDonorPoolStart(long megabytes);
+                            long got = MadeiraDonorPoolStart(poolMB);
+                            LOG("ml1150 donor pool: %ld of %ld MB", got, poolMB);
                         }
                     }
                 }

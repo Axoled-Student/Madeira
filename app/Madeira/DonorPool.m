@@ -1,4 +1,4 @@
-// ml1150: fills the swap tier's memory pool (virtual_ios.c) before Wine starts.
+// ml1150: fills the swap tier's donor pool (virtual_ios.c) before Wine starts.
 //
 // The MadeiraMemoryHost extension creates owned memory regions without touching
 // them, hands their memory entries over and exits. Memory owned by an exited
@@ -9,8 +9,8 @@
 #import <Foundation/Foundation.h>
 #import "MemoryHostProtocol.h"
 
-int madeira_pool_add(unsigned int entry, unsigned long long size);
-void madeira_pool_set_pressure(int level);
+int madeira_donor_pool_add(unsigned int entry, unsigned long long size);
+void madeira_donor_pool_set_pressure(int level);
 
 @protocol MPExtensionClass
 + (id)extensionWithIdentifier:(NSString *)identifier error:(NSError **)error;
@@ -45,13 +45,13 @@ static void MPStartPressureSource(void) {
                                     dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
     dispatch_source_set_event_handler(source, ^{
         unsigned long level = dispatch_source_get_data(source);
-        madeira_pool_set_pressure(level & DISPATCH_MEMORYPRESSURE_CRITICAL ? 2 : level & DISPATCH_MEMORYPRESSURE_WARN ? 1 : 0);
+        madeira_donor_pool_set_pressure(level & DISPATCH_MEMORYPRESSURE_CRITICAL ? 2 : level & DISPATCH_MEMORYPRESSURE_WARN ? 1 : 0);
     });
     dispatch_resume(source);
 }
 
 /// Blocks for at most ~15 s. Returns the MB registered with the tier.
-long MadeiraMemoryPoolStart(long megabytes) {
+long MadeiraDonorPoolStart(long megabytes) {
     const uint64_t region = 512ull << 20;
     const int64_t timeout = 10 * NSEC_PER_SEC;
     long regions = megabytes / 512, added = 0;
@@ -59,7 +59,7 @@ long MadeiraMemoryPoolStart(long megabytes) {
     NSString *identifier = [NSBundle.mainBundle.bundleIdentifier stringByAppendingString:@".MemoryHost"];
     Class<MPExtensionClass> cls = (Class<MPExtensionClass>)NSClassFromString(@"NSExtension");
     id<MPExtension> extension = [cls extensionWithIdentifier:identifier error:nil];
-    if (!extension) { fprintf(stderr, "[swap] ml1150 pool: no extension %s\n", identifier.UTF8String); return 0; }
+    if (!extension) { fprintf(stderr, "[swap] ml1150 donor pool: no extension %s\n", identifier.UTF8String); return 0; }
     dispatch_semaphore_t exited = dispatch_semaphore_create(0);
     [extension setRequestInterruptionBlock:^(NSUUID *uuid) { dispatch_semaphore_signal(exited); }];
 
@@ -77,7 +77,7 @@ long MadeiraMemoryPoolStart(long megabytes) {
     [extension beginExtensionRequestWithInputItems:@[item] completion:^(NSUUID *uuid) { request = uuid; dispatch_semaphore_signal(started); }];
     if (dispatch_semaphore_wait(started, dispatch_time(DISPATCH_TIME_NOW, timeout)) || !request ||
         dispatch_semaphore_wait(delegate.connected, dispatch_time(DISPATCH_TIME_NOW, timeout))) {
-        fprintf(stderr, "[swap] ml1150 pool: the extension did not start or connect; no pool\n");
+        fprintf(stderr, "[swap] ml1150 donor pool: the extension did not start or connect; no pool\n");
         if (request) [extension cancelExtensionRequestWithIdentifier:request];
         return 0;
     }
@@ -91,14 +91,14 @@ long MadeiraMemoryPoolStart(long megabytes) {
             dispatch_semaphore_signal(reply);
         }];
         if (dispatch_semaphore_wait(reply, dispatch_time(DISPATCH_TIME_NOW, timeout)) || entry == MACH_PORT_NULL) break;
-        if (madeira_pool_add(entry, region) != 0) { mach_port_deallocate(mach_task_self(), entry); break; }
+        if (madeira_donor_pool_add(entry, region) != 0) { mach_port_deallocate(mach_task_self(), entry); break; }
         added++;
     }
     // The extension exits; from then on its regions are billed to nobody.
     [(id<MHMemoryServer>)[connection remoteObjectProxyWithErrorHandler:^(NSError *e) {}] exitWithReply:^{}];
     BOOL gone = dispatch_semaphore_wait(exited, dispatch_time(DISPATCH_TIME_NOW, timeout)) == 0;
     [connection invalidate];
-    fprintf(stderr, "[swap] ml1150 pool: %ld x 512 MB registered, extension %s\n", added, gone ? "exited" : "did NOT report exiting");
+    fprintf(stderr, "[swap] ml1150 donor pool: %ld x 512 MB registered, extension %s\n", added, gone ? "exited" : "did NOT report exiting");
     if (added) MPStartPressureSource();
     return added * 512;
 }
