@@ -31,7 +31,7 @@ jobs:
       fex_run: '36570067105'
       llvm_run: '36570067105'
       wine_run: '36570067105'
-      i386_run: 'PENDING'
+      i386_run: '36574576555'
   full:
     if: ${{ !contains(github.event.head_commit.message, '[ci-deps:') && !contains(github.event.head_commit.message, '[ci-app]') }}
     uses: ./.github/workflows/ios-app.yml
