@@ -83,6 +83,13 @@ ditto "$MADEIRA_APP" build/ipa/Payload/Madeira.app
 (cd build/ipa && zip -qry ../../ci-output/Madeira-unsigned.ipa Payload)
 unzip -t ci-output/Madeira-unsigned.ipa | tail -1
 shasum -a 256 ci-output/Madeira-unsigned.ipa > ci-output/SHA256SUMS
+# What the IPA holds, in the log: the result can be checked without downloading it.
+ls -l ci-output/Madeira-unsigned.ipa
+cat ci-output/SHA256SUMS
+echo "IPA entries: $(unzip -Z1 ci-output/Madeira-unsigned.ipa | wc -l | tr -d ' ')"
+unzip -l ci-output/Madeira-unsigned.ipa \
+  | grep -E 'Payload/Madeira\.app/(Madeira|Info\.plist|Madeira\.entitlements|arm64ec-windows/(xtajit64\.dll|d3d11\.dll|winemetal\.dll|dockhost\.exe)|aarch64-windows/xtajit\.dll|d3d12/libmetalirconverter\.dylib|licenses/LICENSE-MADEIRA-GPL-3\.0\.txt)$' \
+  || true
 git rev-parse HEAD > ci-output/source-commit.txt
 git submodule status > ci-output/submodule-commits.txt
 cp app/Madeira/Madeira.entitlements ci-output/
