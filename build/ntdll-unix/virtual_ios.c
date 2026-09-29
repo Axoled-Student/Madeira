@@ -14371,8 +14371,121 @@ static void ios_swap_free_add( uint64_t off, uint64_t len )
     if (ios_swap_nfree < 8192) { ios_swap_free[ios_swap_nfree].off = off; ios_swap_free[ios_swap_nfree].len = len; ios_swap_nfree++; }
     else ios_swap_free_drop++;   /* leaked offset space: later backings may be refused, never wrong */
 }
+/* ml1150: MEMORY POOL, the tier's first stage (2026-09-29 extension experiment,
+ * app/Madeira/MemoryHostTest.m runs 2-6). Memory OWNED by another task is
+ * billed to that task's phys_footprint, and once the owner has exited, to
+ * nobody. The app starts its MadeiraMemoryHost extension, which creates owned
+ * regions without touching them, hands their memory entries over and exits;
+ * madeira_pool_add() registers them here. A tier range is mapped from a pool
+ * region while the guard allows it, else from the file as before. Measured on
+ * the iPhone 18 Pro: 14.5 GB of 2:1-compressible data held and verified on an
+ * 11.5 GB phone, footprint +5 MB, reads at full speed after compression; but
+ * running the SYSTEM out of pages kills Madeira (memory-vmpage-shortage). The
+ * guard therefore stops taking pool memory when iOS reports memory pressure
+ * (madeira_pool_set_pressure from a dispatch source in the app) or when free
+ * RAM falls below MADEIRA_POOL_MARGIN_MB (default 1024). Already-mapped pool
+ * ranges stay where they are; moving them to the file under pressure is not
+ * done yet. A freed pool range is zeroed with MADV_ZERO through a private
+ * window onto the region, so a recommit reads zero like a punched file hole.
+ * Pool offsets carry IOS_POOL_FLAG so the extent table needs no new field. */
+#define IOS_POOL_FLAG (1ull << 63)
+#define IOS_POOL_MAX_REGIONS 128
+#ifdef __APPLE__
+extern kern_return_t mach_vm_map( vm_map_t, mach_vm_address_t *, mach_vm_size_t, mach_vm_offset_t, int,
+                                  mem_entry_name_port_t, memory_object_offset_t, boolean_t, vm_prot_t, vm_prot_t, vm_inherit_t );
+static struct { mach_port_t entry; char *window; uint64_t bump; } ios_pool_reg[IOS_POOL_MAX_REGIONS];
+static unsigned ios_pool_nreg;               /* published with release ordering by madeira_pool_add */
+static uint64_t ios_pool_region;             /* every region's size (the first one sets it) */
+static struct { uint64_t off, len; } ios_pool_free[4096];
+static unsigned ios_pool_nfree;
+static int ios_pool_pressure;                /* 0 normal, 1 warning, 2 critical */
+static uint64_t ios_pool_margin = 1024ull << 20;
+static unsigned long long ios_pool_bytes, ios_pool_peak, ios_pool_takes, ios_pool_guarded, ios_pool_lost;
+
+/* Called by the app (MemoryPool.m) before Wine starts, one region at a time. */
+int madeira_pool_add( unsigned int entry, unsigned long long size )
+{
+    mach_vm_address_t window = 0;
+    unsigned n = __atomic_load_n( &ios_pool_nreg, __ATOMIC_ACQUIRE );
+    const char *margin = getenv( "MADEIRA_POOL_MARGIN_MB" );
+    if (n >= IOS_POOL_MAX_REGIONS || !size || (ios_pool_region && size != ios_pool_region)) return -1;
+    if (mach_vm_map( mach_task_self(), &window, size, 0, VM_FLAGS_ANYWHERE, entry, 0, FALSE,
+                     VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE ) != KERN_SUCCESS) return -1;
+    if (margin) ios_pool_margin = strtoull( margin, NULL, 10 ) << 20;
+    ios_pool_region = size;
+    ios_pool_reg[n].entry = entry; ios_pool_reg[n].window = (char *)window; ios_pool_reg[n].bump = 0;
+    __atomic_store_n( &ios_pool_nreg, n + 1, __ATOMIC_RELEASE );
+    if (n == 0) dprintf( 2, "[swap] ml1150 pool: regions of %llu MB, guard margin %llu MB\n", size >> 20,
+                         (unsigned long long)(ios_pool_margin >> 20) );
+    return 0;
+}
+void madeira_pool_set_pressure( int level )
+{
+    __atomic_store_n( &ios_pool_pressure, level, __ATOMIC_RELAXED );
+    dprintf( 2, "[swap] ml1150 pool: memory pressure %s; pool %llu MB in use\n",
+             level >= 2 ? "CRITICAL" : level ? "warning" : "normal", ios_pool_bytes >> 20 );
+}
+static uint64_t ios_pool_system_free( void )
+{
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64( mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count ) != KERN_SUCCESS) return 0;
+    return (uint64_t)vm.free_count * vm_kernel_page_size;
+}
+/* A pool offset for len bytes inside one region, or -1 (the guard, or no room). */
+static uint64_t ios_pool_take( size_t len )
+{
+    unsigned i, best = ~0u, n = __atomic_load_n( &ios_pool_nreg, __ATOMIC_ACQUIRE );
+    if (!n || len > ios_pool_region) return (uint64_t)-1;
+    if (__atomic_load_n( &ios_pool_pressure, __ATOMIC_RELAXED ) || ios_pool_system_free() < ios_pool_margin)
+    {
+        ios_pool_guarded++;
+        return (uint64_t)-1;
+    }
+    for (i = 0; i < ios_pool_nfree; i++)
+        if (ios_pool_free[i].len >= len && (best == ~0u || ios_pool_free[i].len < ios_pool_free[best].len)) best = i;
+    if (best != ~0u)
+    {
+        uint64_t off = ios_pool_free[best].off;
+        if (ios_pool_free[best].len > len) { ios_pool_free[best].off += len; ios_pool_free[best].len -= len; }
+        else ios_pool_free[best] = ios_pool_free[--ios_pool_nfree];
+        return off;
+    }
+    for (i = 0; i < n; i++)
+        if (ios_pool_reg[i].bump + len <= ios_pool_region)
+        {
+            uint64_t off = (uint64_t)i * ios_pool_region + ios_pool_reg[i].bump;
+            ios_pool_reg[i].bump += len;
+            return off;
+        }
+    return (uint64_t)-1;
+}
+static int ios_pool_map( char *va, size_t len, int unix_prot, uint64_t off )
+{
+    mach_vm_address_t addr = (mach_vm_address_t)va;
+    unsigned r = (unsigned)(off / ios_pool_region);
+    /* PROT_READ/PROT_WRITE have the VM_PROT values */
+    return mach_vm_map( mach_task_self(), &addr, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, ios_pool_reg[r].entry,
+                        off % ios_pool_region, FALSE, unix_prot & (VM_PROT_READ | VM_PROT_WRITE),
+                        VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE ) == KERN_SUCCESS ? 0 : -1;
+}
+static void ios_pool_give( uint64_t off, size_t len )
+{
+    unsigned r = (unsigned)(off / ios_pool_region);
+    madvise( ios_pool_reg[r].window + off % ios_pool_region, len, MADV_ZERO );
+    ios_pool_bytes -= len;
+    if (ios_pool_nfree < 4096) { ios_pool_free[ios_pool_nfree].off = off; ios_pool_free[ios_pool_nfree].len = len; ios_pool_nfree++; }
+    else ios_pool_lost += len;
+}
+#else
+static uint64_t ios_pool_take( size_t len ) { (void)len; return (uint64_t)-1; }
+static int ios_pool_map( char *va, size_t len, int unix_prot, uint64_t off ) { (void)va; (void)len; (void)unix_prot; (void)off; return -1; }
+static void ios_pool_give( uint64_t off, size_t len ) { (void)off; (void)len; }
+static unsigned long long ios_pool_bytes, ios_pool_peak, ios_pool_takes, ios_pool_guarded, ios_pool_lost;
+#endif
 static void ios_swap_give( uint64_t off, size_t len )
 {
+    if (off & IOS_POOL_FLAG) { ios_pool_give( off & ~IOS_POOL_FLAG, len ); return; }
     struct fpunchhole ph;
     memset( &ph, 0, sizeof(ph) );
     ph.fp_offset = (off_t)off; ph.fp_length = (off_t)len;
@@ -14425,6 +14538,20 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     if (he <= hs) return IOS_SW_SMALL;
     if (ios_swap_n >= 16384) { if (ios_swap_v2) ios_swap_refused++; return IOS_SW_REFUSED; }
     len = he - hs;
+    off = ios_pool_take( len );   /* ml1150: the pool first, while the guard allows */
+    if (off != (uint64_t)-1)
+    {
+        if (!ios_pool_map( hs, len, unix_prot, off ))
+        {
+            off |= IOS_POOL_FLAG;
+            ios_pool_bytes += len; if (ios_pool_bytes > ios_pool_peak) ios_pool_peak = ios_pool_bytes;
+            ios_pool_takes++;
+            p = hs;
+            goto mapped;
+        }
+        ios_pool_give( off, len );
+        ios_pool_bytes += len;   /* give subtracts */
+    }
     off = ios_swap_take( len );
     if (off == (uint64_t)-1) { ios_swap_refused++; return IOS_SW_REFUSED; }
     p = mmap( hs, len, unix_prot, MAP_FIXED | MAP_SHARED, ios_swap_fd, (off_t)off );
@@ -14435,6 +14562,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
         ios_swap_give( off, len );
         return IOS_SW_MAPFAIL;
     }
+mapped:
     ios_swap_ext[ios_swap_n].va = hs; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off; ios_swap_n++;
     ios_swap_bytes += len; if (ios_swap_bytes > ios_swap_peak) ios_swap_peak = ios_swap_bytes;
     ios_swap_backs++;
@@ -14554,6 +14682,9 @@ void ios_swap_stats_line( void )
     dprintf( 2, "[swap] ml1077 stats: %llu MB file-backed now (peak %llu), %u extents, file used %llu of %llu MB, backs %llu releases %llu unbacks %llu refused %llu\n",
              ios_swap_bytes >> 20, ios_swap_peak >> 20, ios_swap_n, (unsigned long long)(ios_swap_bump >> 20),
              (unsigned long long)(ios_swap_cap >> 20), ios_swap_backs, ios_swap_releases, ios_swap_unbacks, ios_swap_refused );
+    if (ios_pool_takes || ios_pool_guarded)
+        dprintf( 2, "[swap] ml1150 pool: %llu MB in use (peak %llu), %llu takes, %llu guarded, %llu MB lost to a full free list\n",
+                 ios_pool_bytes >> 20, ios_pool_peak >> 20, ios_pool_takes, ios_pool_guarded, ios_pool_lost >> 20 );
 }
 /* The census line, formatted by hand into a stack buffer (no stdio, no heap). */
 static char *ios_swap_put( char *p, char *end, const char *s )

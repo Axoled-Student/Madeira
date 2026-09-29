@@ -1671,16 +1671,43 @@ enum SettingsSheet: String, Identifiable {
     var id: String { rawValue }
 }
 
+/// Runs the extension memory experiment (MemoryHostTest.m): whether memory
+/// created by the MadeiraMemoryHost extension stays off Madeira's footprint.
+/// Results in Documents/memhost-test.txt and the log.
+struct MemoryHostTestRow: View {
+    @State private var running = false
+    @State private var last = ""
+    var body: some View {
+        Button {
+            running = true
+            last = "Starting…"
+            MadeiraMemoryHostTest({ line in
+                LogStore.shared.log("[memhost] \(line)")
+                DispatchQueue.main.async { last = line }
+            }, {
+                DispatchQueue.main.async { running = false }
+            })
+        } label: {
+            Label(running ? "Testing extension memory…" : "Test extension memory", systemImage: "memorychip")
+        }
+        .disabled(running)
+        if !last.isEmpty {
+            Text(last).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
 struct RuntimeMemorySyncSettings: View {
     /// Opens a Settings sheet (LibraryView owns the presentation).
     var open: (SettingsSheet) -> Void = { _ in }
     /// Bumped when a Settings sheet closes, so the rows re-read madeira.cfg.
     var refresh = 0
     /// The keys this section owns; All settings leaves them out.
-    static let featuredKeys: Set<String> = ["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync", "eco"]
+    static let featuredKeys: Set<String> = ["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "mempool-mb", "inproc-sync", "eco"]
     static let poolChoices = [0, 512, 640, 768, 1024, 1152]          // 0 = the standard 896 MB
     static let vramChoices = [0, 1536, 2048, 3072, 4096, 4352, 4608, 5120, 6144]   // 0 = automatic
     static let swapChoices = [0, 1024, 2048, 3072, 4096]
+    static let memPoolChoices = [0, 2048, 4096, 6144]
     /// The stored value "" (no key) and "classic" are the same rules.
     static let coverageChoices: [(String, String)] = [
         ("", "Large allocations (8 MB+)"), ("blocks", "All allocations of 1 MB+"), ("wide", "1 MB+ and overflow"),
@@ -1688,6 +1715,7 @@ struct RuntimeMemorySyncSettings: View {
     @State private var poolMB = Self.intKey("pool")
     @State private var vramMB = Self.intKey("vram-mb")
     @State private var swapMB = Self.intKey("swap-mb")
+    @State private var memPoolMB = Self.intKey("mempool-mb")
     @State private var coverage = Self.currentCoverage()
     @State private var madsync = MadeiraConfig.bool("inproc-sync", default: true)
     @State private var eco = MadeiraConfig.bool("eco", default: false)
@@ -1732,6 +1760,9 @@ struct RuntimeMemorySyncSettings: View {
                 if !Self.coverageChoices.contains(where: { $0.0 == coverage }) { Text(coverage).tag(coverage) }
             }
             .disabled(swapMB == 0)
+            mbPicker("Memory pool", key: "mempool-mb", value: $memPoolMB, choices: Self.memPoolChoices,
+                     zero: "Off", label: Self.gb)
+                .disabled(swapMB == 0)
             Toggle("Madsync", isOn: Binding(get: { madsync }, set: { on in
                 madsync = on; changed = true
                 MadeiraConfig.set("inproc-sync", on ? nil : "0")
@@ -1745,18 +1776,20 @@ struct RuntimeMemorySyncSettings: View {
             Button { open(.allSettings) } label: {
                 Label("All settings (\(ConfigCatalog.generated.count - Self.featuredKeys.count) more)", systemImage: "slider.horizontal.3")
             }
+            MemoryHostTestRow()
         } header: { Text("Memory & sync") } footer: {
             VStack(alignment: .leading, spacing: 4) {
                 Text("JIT pool is the memory reserved at launch for translated x86 code (256 to 1152 MB).")
                 Text("Video memory is how much graphics memory games are told they have. Automatic sizes it from the memory free at launch. Too high can get Madeira closed for using too much memory; too low makes games keep reloading textures.")
                 Text("Swap tier moves game data to a file on this device's storage when memory runs short, up to the chosen size, at some speed cost. Coverage decides which allocations it moves: large ones only (8 MB and up, the default), every allocation of 1 MB and up, or those plus allocations that overflow the game's address range. Wider coverage saves more memory but can slow a game down.")
+                Text("Memory pool gives the swap tier RAM that does not count against Madeira's memory limit (memory handed over by Madeira's helper extension), used before the swap file while the phone has memory to spare. It stops taking more when iOS reports memory pressure. Experimental; needs the swap tier on.")
                 Text("Madsync is the in-process synchronisation engine (on by default).")
                 Text("Eco mode starts every game with its threads at a low priority, which saves power but makes games run slower. Off by default. It is meant for loading screens: the ECO pill in the performance overlay turns it on and off while a game runs.")
                 if changed { Text("Restart Madeira (close it from the app switcher) for these changes to apply.").foregroundStyle(.orange) }
             }
         }
         .onChange(of: refresh) { _, _ in
-            poolMB = Self.intKey("pool"); vramMB = Self.intKey("vram-mb"); swapMB = Self.intKey("swap-mb")
+            poolMB = Self.intKey("pool"); vramMB = Self.intKey("vram-mb"); swapMB = Self.intKey("swap-mb"); memPoolMB = Self.intKey("mempool-mb")
             coverage = Self.currentCoverage(); madsync = MadeiraConfig.bool("inproc-sync", default: true)
             eco = MadeiraConfig.bool("eco", default: false)
         }
