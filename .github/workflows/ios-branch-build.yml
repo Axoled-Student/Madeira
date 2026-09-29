@@ -3,8 +3,10 @@ name: Build Madeira iPhone package (branch validation)
 # this runs the build for pushes to the development branch. Delete once the
 # workflows are on main.
 #
-# A head commit message containing [ci-deps:fex], [ci-deps:llvm] or
-# [ci-deps:wine] builds just that dependency; otherwise the full IPA is built.
+# The head commit message selects what runs:
+#   [ci-deps:fex] [ci-deps:llvm] [ci-deps:wine]  build just that dependency
+#   [ci-app]     assemble the IPA from earlier runs' dependency artifacts
+#   (neither)    the full build, dependencies included
 on:
   push:
     branches: [claude/dazzling-mccarthy-7x4b15]
@@ -22,6 +24,13 @@ jobs:
     uses: ./.github/workflows/ios-dependencies.yml
     with:
       component: ${{ contains(github.event.head_commit.message, '[ci-deps:fex]') && 'fex' || contains(github.event.head_commit.message, '[ci-deps:wine]') && 'wine' || 'llvm' }}
+  app-from-artifacts:
+    if: ${{ contains(github.event.head_commit.message, '[ci-app]') }}
+    uses: ./.github/workflows/ios-app.yml
+    with:
+      fex_run: '36567847921'
+      llvm_run: '36567536761'
+      wine_run: '36568431973'
   full:
-    if: ${{ !contains(github.event.head_commit.message, '[ci-deps:') }}
+    if: ${{ !contains(github.event.head_commit.message, '[ci-deps:') && !contains(github.event.head_commit.message, '[ci-app]') }}
     uses: ./.github/workflows/ios-app.yml
