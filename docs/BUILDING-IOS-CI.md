@@ -39,6 +39,18 @@ an unrelated change skips it.
 The Wine PE modules under `app/Madeira/*-windows` and the GnuTLS archives are
 the ones committed to the repository; they are not rebuilt.
 
+## Toolchain note
+
+The hosted runners provide Xcode 26.x (the iOS 26.2 SDK on `macos-15`); the
+scripts use Xcode 26.3 when the image has it, otherwise the newest 26.x. The
+tree also builds with the iOS 27 SDK. `build/ntdll-unix/server_ios.c` reads
+`ri_page_wait_time_mach` from `struct rusage_info_v6`, which only the iOS 27 SDK
+has, so that read is guarded on `__IPHONE_OS_VERSION_MAX_ALLOWED`: with an older
+SDK the `pgw=` column of the `[xp]` log line reads 0.
+
+Workflows are started from the Actions tab, which lists a workflow only once
+its file is on the default branch.
+
 ## Not covered
 
 - The 32-bit `i386-windows` Wine farm (`build/wine-i386/build.sh`) is not built.
