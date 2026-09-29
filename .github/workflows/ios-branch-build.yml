@@ -1,0 +1,18 @@
+name: Build Madeira iPhone package (branch validation)
+# Temporary: workflow_dispatch only works for workflows on the default branch, so
+# this runs the full build for pushes to the development branch. Delete once
+# the workflows are on main.
+on:
+  push:
+    branches: [claude/dazzling-mccarthy-7x4b15]
+    paths:
+      - .github/workflows/ios-*.yml
+      - scripts/ci-*.sh
+      - patches/fex-native-diagnostics.patch
+      - build/**
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build:
+    uses: ./.github/workflows/ios-app.yml

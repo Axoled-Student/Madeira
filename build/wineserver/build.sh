@@ -13,12 +13,12 @@ OBJ_DIR="$BUILD_DIR/obj"
 mkdir -p "$OBJ_DIR"
 
 # Copy the base library if we don't have one yet
+BOOTSTRAP_BASE=0
 if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
     if [ -f "$APP_LIB" ]; then
         cp "$APP_LIB" "$OBJ_DIR/libwineserver.a"
     else
-        echo "ERROR: No base libwineserver.a found"
-        exit 1
+        BOOTSTRAP_BASE=1
     fi
 fi
 
@@ -103,6 +103,27 @@ PATCHED_FILES=(
     # copy adds the [srv-conn]/[tcp-state]/[tcp-enum] probes.
     "sock:$WINE_SRC/server/sock.c:sock.o"
 )
+
+# A clean checkout has no base archive (it is a git-ignored build output).
+# Compile the unpatched server sources with the same iOS flags, leaving out the
+# ones PATCHED_FILES replaces, so the patched objects below have an archive to
+# be inserted into.
+if [ "$BOOTSTRAP_BASE" -eq 1 ]; then
+    echo "=== Bootstrapping wineserver from source ==="
+    BASE_OBJECTS=()
+    while read -r src; do
+        name="${src%.c}"
+        replaced=0
+        for entry in "${PATCHED_FILES[@]}"; do
+            [ "${entry##*:}" = "$name.o" ] && replaced=1
+        done
+        [ "$replaced" -eq 1 ] && continue
+        compile_one "$WINE_SRC/server/$src" "$name"
+        BASE_OBJECTS+=("$OBJ_DIR/$name.o")
+    done < <(sed -nE 's/^[[:space:]]*([a-z0-9_]+\.c).*$/\1/p' "$WINE_SRC/server/Makefile.in")
+    [ "${#BASE_OBJECTS[@]}" -gt 0 ] || { echo 'No wineserver sources found'; exit 1; }
+    ar rcs "$OBJ_DIR/libwineserver.a" "${BASE_OBJECTS[@]}"
+fi
 
 echo "=== Building kill wrapper (without kill macro) ==="
 echo -n "  wineserver_ios_kill... "

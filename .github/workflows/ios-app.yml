@@ -1,0 +1,100 @@
+name: Build Madeira iPhone package
+on:
+  workflow_call:
+    inputs:
+      configuration:
+        type: string
+        default: Debug
+      fex_run:
+        type: string
+        default: ''
+      llvm_run:
+        type: string
+        default: ''
+      wine_run:
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode configuration (docs/BUILDING.md - Release builds have crashed the guest)
+        type: choice
+        options: [Debug, Release]
+        default: Debug
+      fex_run:
+        description: Run containing ios-fex to reuse (blank builds FEX in this run)
+        required: false
+        type: string
+      llvm_run:
+        description: Run containing ios-llvm to reuse (blank builds LLVM in this run)
+        required: false
+        type: string
+      wine_run:
+        description: Run containing ios-wine to reuse (blank builds Wine in this run)
+        required: false
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  # Each dependency is built here unless a run to reuse was given.
+  fex:
+    if: ${{ inputs.fex_run == '' }}
+    uses: ./.github/workflows/ios-dependencies.yml
+    with:
+      component: fex
+  llvm:
+    if: ${{ inputs.llvm_run == '' }}
+    uses: ./.github/workflows/ios-dependencies.yml
+    with:
+      component: llvm
+  wine:
+    if: ${{ inputs.wine_run == '' }}
+    uses: ./.github/workflows/ios-dependencies.yml
+    with:
+      component: wine
+  app:
+    needs: [fex, llvm, wine]
+    # A skipped dependency job (reused run) is fine; a failed one is not.
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-fex
+          run-id: ${{ inputs.fex_run || github.run_id }}
+          github-token: ${{ github.token }}
+          path: build-inputs/fex
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-llvm
+          run-id: ${{ inputs.llvm_run || github.run_id }}
+          github-token: ${{ github.token }}
+          path: build-inputs/llvm
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-wine
+          run-id: ${{ inputs.wine_run || github.run_id }}
+          github-token: ${{ github.token }}
+          path: build-inputs/wine
+      - name: Build and package
+        env:
+          MADEIRA_CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+        run: |
+          mkdir -p ci-output
+          set -o pipefail
+          bash scripts/ci-build-app.sh 2>&1 | tee ci-output/app-build.log
+      - name: Preserve package and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-iPhone
+          path: |
+            ci-output/
+            build/dxmt-ios/obj/*.err
+          if-no-files-found: error
+          retention-days: 30

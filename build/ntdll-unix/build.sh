@@ -188,6 +188,9 @@ echo ""
 echo "Results: $SUCCEEDED succeeded, $FAILED failed"
 if [ -n "$FAILED_FILES" ]; then
     echo "Failed:$FAILED_FILES"
+    # Show why: if one of these is an object archived below, the ar step fails
+    # on the missing file and this is the only place the reason is printed.
+    for name in $FAILED_FILES; do cat "$OBJ_DIR/$name.err"; done
 fi
 
 echo ""
