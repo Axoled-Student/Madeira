@@ -16,6 +16,7 @@ madeira_select_xcode() {
   else
     echo "warning: no Xcode 26.x found; using $(xcode-select -p)" >&2
   fi
+  ls -d /Applications/Xcode*.app 2>/dev/null || true
   xcodebuild -version
 }
 

@@ -1026,6 +1026,15 @@ static void ios_guest_rip_profile( int gen )
  * rusage CPU time and the per-thread sum so the conversion can be checked. */
 #include <sys/resource.h>
 #include <sys/sysctl.h>
+#include <Availability.h>
+/* struct rusage_info_v6 has ri_page_wait_time_mach only in the iOS 27 SDK; the
+ * iOS 26.x SDKs (Xcode 26, e.g. the hosted CI runners) lack it, and the value
+ * feeds one column (pgw=) of the [xp] line, which reads 0 there. */
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
+#define XP_PAGE_WAIT_TICKS( a, b ) ((a).ri_page_wait_time_mach - (b).ri_page_wait_time_mach)
+#else
+#define XP_PAGE_WAIT_TICKS( a, b ) 0
+#endif
 extern int proc_pid_rusage( int pid, int flavor, void *buffer );
 extern int proc_pidinfo( int pid, int flavor, uint64_t arg, void *buffer, int buffersize );
 volatile uint64_t ios_xp_pe_block, ios_xp_pe_len;
@@ -1499,7 +1508,7 @@ static void ios_xprobe_main( void )
             n = snprintf( line, sizeof(line),
                           "[xp] %s +%.2f dt=%.0f cpu=%.0f (thr %.0f) P=%.0f E=%.0f run=%.0f pgw=%.1f GHz P=%.2f E=%.2f Minst=%.0f IPC=%.2f mJ=%.0f pin=%llu rdKB=%llu fpMB=%llu",
                           wall, XP_MS( now - t_start ) / 1000.0, dt_ms, cpu, sum_thr_ms, pms, ems,
-                          XP_MS( ru.ri_runnable_time - pru.ri_runnable_time ), XP_MS( ru.ri_page_wait_time_mach - pru.ri_page_wait_time_mach ),
+                          XP_MS( ru.ri_runnable_time - pru.ri_runnable_time ), XP_MS( XP_PAGE_WAIT_TICKS( ru, pru ) ),
                           pms > 0 ? pcy / (pms * 1e6) : 0, ems > 0 ? (cy - pcy) / (ems * 1e6) : 0, ins / 1e6, cy > 0 ? ins / cy : 0,
                           (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6,
                           (unsigned long long)(ru.ri_pageins - pru.ri_pageins), (unsigned long long)((ru.ri_diskio_bytesread - pru.ri_diskio_bytesread) >> 10),

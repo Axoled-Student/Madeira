@@ -92,9 +92,12 @@ case "$component" in
     # app links.
     bash build/ffmpeg/build.sh
 
-    bash build/wineserver/build.sh
-    bash build/ntdll-unix/build.sh
-    bash build/win32u-unix/build.sh
+    # Run all three even if one fails, so one run reports every failure.
+    wine_failed=0
+    for step in wineserver ntdll-unix win32u-unix; do
+      bash "build/$step/build.sh" || { echo "build/$step/build.sh failed" >&2; wine_failed=1; }
+    done
+    [ "$wine_failed" -eq 0 ] || exit 1
     tar -czf ci-output/wine-ios.tar.gz \
       app/Madeira/libwineserver.a app/Madeira/libntdll_unix.a app/Madeira/libwin32u_unix.a \
       app/Madeira/libavformat.a app/Madeira/libavcodec.a \
