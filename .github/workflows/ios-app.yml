@@ -14,6 +14,9 @@ on:
       wine_run:
         type: string
         default: ''
+      i386_run:
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       configuration:
@@ -31,6 +34,10 @@ on:
         type: string
       wine_run:
         description: Run containing ios-wine to reuse (blank builds Wine in this run)
+        required: false
+        type: string
+      i386_run:
+        description: Run containing ios-i386 (the 32-bit Windows farm) to reuse (blank builds it in this run)
         required: false
         type: string
 permissions:
@@ -53,8 +60,13 @@ jobs:
     uses: ./.github/workflows/ios-dependencies.yml
     with:
       component: wine
+  i386:
+    if: ${{ inputs.i386_run == '' }}
+    uses: ./.github/workflows/ios-dependencies.yml
+    with:
+      component: i386
   app:
-    needs: [fex, llvm, wine]
+    needs: [fex, llvm, wine, i386]
     # A skipped dependency job (reused run) is fine; a failed one is not.
     if: ${{ !failure() && !cancelled() }}
     runs-on: macos-15
@@ -81,6 +93,12 @@ jobs:
           run-id: ${{ inputs.wine_run || github.run_id }}
           github-token: ${{ github.token }}
           path: build-inputs/wine
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-i386
+          run-id: ${{ inputs.i386_run || github.run_id }}
+          github-token: ${{ github.token }}
+          path: build-inputs/i386
       - name: Build and package
         env:
           MADEIRA_CONFIGURATION: ${{ inputs.configuration || 'Debug' }}

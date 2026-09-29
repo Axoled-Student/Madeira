@@ -1,6 +1,6 @@
 #!/bin/bash
 # Assemble the unsigned Madeira IPA from the prebuilt FEX, LLVM and Wine archives
-# (build-inputs/{fex,llvm,wine}, produced by ci-build-dependency.sh).
+# (build-inputs/{fex,llvm,wine,i386}, produced by ci-build-dependency.sh).
 # MADEIRA_CONFIGURATION selects the Xcode configuration; it defaults to Debug
 # because docs/BUILDING.md records that Release builds have crashed the guest.
 set -euo pipefail
@@ -16,7 +16,7 @@ git -C FEX submodule update --init --depth 1 --jobs 3 \
   External/fmt External/xxhash External/range-v3 External/unordered_dense
 git -C research/dxmt submodule update --init --depth 1 --recursive --jobs 3
 
-for component in fex llvm wine; do
+for component in fex llvm wine i386; do
   MADEIRA_INPUT_ARCHIVE="$(find "build-inputs/$component" -name "$component-ios.tar.gz" -type f)"
   MADEIRA_INPUT_HASH="$(find "build-inputs/$component" -name "$component-sha256.txt" -type f)"
   test -f "$MADEIRA_INPUT_ARCHIVE"
@@ -71,6 +71,11 @@ for module in xtajit64.dll d3d11.dll winemetal.dll dockhost.exe; do
   test -s "$MADEIRA_APP/arm64ec-windows/$module"
 done
 test -s "$MADEIRA_APP/d3d12/libmetalirconverter.dylib"
+# The 32-bit farm: without i386-windows/ntdll.dll a 32-bit target is never treated
+# as one (docs/WOW64.md), and d3d9.dll is what a 32-bit D3D9 game loads.
+for module in ntdll.dll kernel32.dll d3d9.dll d3d9-emulated.dll d3d11.dll winemetal.dll; do
+  test -s "$MADEIRA_APP/i386-windows/$module"
+done
 plutil -lint "$MADEIRA_APP/Info.plist"
 lipo "$MADEIRA_APP/Madeira" -verify_arch arm64
 otool -L "$MADEIRA_APP/Madeira" | tee ci-output/linked-libraries.txt
@@ -88,8 +93,9 @@ ls -l ci-output/Madeira-unsigned.ipa
 cat ci-output/SHA256SUMS
 echo "IPA entries: $(unzip -Z1 ci-output/Madeira-unsigned.ipa | wc -l | tr -d ' ')"
 unzip -l ci-output/Madeira-unsigned.ipa \
-  | grep -E 'Payload/Madeira\.app/(Madeira|Info\.plist|Madeira\.entitlements|arm64ec-windows/(xtajit64\.dll|d3d11\.dll|winemetal\.dll|dockhost\.exe)|aarch64-windows/xtajit\.dll|d3d12/libmetalirconverter\.dylib|licenses/LICENSE-MADEIRA-GPL-3\.0\.txt)$' \
+  | grep -E 'Payload/Madeira\.app/(Madeira|Info\.plist|Madeira\.entitlements|arm64ec-windows/(xtajit64\.dll|d3d11\.dll|winemetal\.dll|dockhost\.exe)|aarch64-windows/xtajit\.dll|i386-windows/(ntdll|kernel32|d3d9|d3d9-emulated|winemetal)\.dll|d3d12/libmetalirconverter\.dylib|licenses/LICENSE-MADEIRA-GPL-3\.0\.txt)$' \
   || true
+echo "i386-windows entries: $(unzip -Z1 ci-output/Madeira-unsigned.ipa | grep -c 'Payload/Madeira.app/i386-windows/' || true)"
 git rev-parse HEAD > ci-output/source-commit.txt
 git submodule status > ci-output/submodule-commits.txt
 cp app/Madeira/Madeira.entitlements ci-output/
@@ -105,7 +111,7 @@ The target is a physical ARM64 iPhone/iPad. JIT must be enabled through the
 project's StikDebug workflow before game use.
 The package contains the Wine PE modules committed to the repository and
 source-built iOS libraries (FEX, Wine unix side, FFmpeg, DXMT, Madeira Dock).
-The 32-bit (i386-windows) Wine farm is not built by this workflow.
+The 32-bit (i386-windows) Wine farm is included, so 32-bit games can start.
 Microsoft's optional Visual C++ redistributable DLLs are not bundled; see
 fetch-vcruntime.md.
 Compilation and archive validation do not establish on-device compatibility.

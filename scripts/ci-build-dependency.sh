@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the source-pinned native dependencies on a hosted macOS runner, without
-# signing or a device. Usage: scripts/ci-build-dependency.sh fex|llvm|wine
+# signing or a device. Usage: scripts/ci-build-dependency.sh fex|llvm|wine|i386
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MADEIRA_ROOT="$PWD"
@@ -9,7 +9,7 @@ MADEIRA_JOBS="$(sysctl -n hw.ncpu)"
 source scripts/ci-common.sh
 mkdir -p ci-output toolchains
 
-component="${1:?Expected fex, llvm, or wine}"
+component="${1:?Expected fex, llvm, wine, or i386}"
 case "$component" in
   fex)
     madeira_select_xcode
@@ -102,6 +102,25 @@ case "$component" in
       app/Madeira/libwineserver.a app/Madeira/libntdll_unix.a app/Madeira/libwin32u_unix.a \
       app/Madeira/libavformat.a app/Madeira/libavcodec.a \
       app/Madeira/libswresample.a app/Madeira/libavutil.a
+    ;;
+  i386)
+    # The 32-bit Windows farm WoW64 sessions load (app/Madeira/i386-windows):
+    # every i386 Wine module, plus DXMT's i386 d3d9/d3d11/dxgi/winemetal. Without
+    # it the app logs "PE probe: machine=0x14c (i386, but the bundle has no
+    # i386-windows)" and a 32-bit game aborts in build_wow64_parameters.
+    madeira_select_xcode
+    git submodule update --init --depth 1 wine research/dxmt
+    git -C research/dxmt submodule update --init --depth 1 --recursive --jobs 3
+    madeira_fetch_llvm_mingw
+    MADEIRA_BREW_BISON="$(brew --prefix bison)"   # Wine's configure needs bison 3+
+    export PATH="$MADEIRA_MINGW_BIN:$MADEIRA_BREW_BISON/bin:$PATH"
+    JOBS="$MADEIRA_JOBS" bash build/wine-i386/build.sh || {
+      status=$?
+      echo '--- tail of the i386 build log' >&2
+      tail -n 120 wine/build-i386/madeira-i386-build.log >&2 || true
+      exit "$status"
+    }
+    tar -czf ci-output/i386-ios.tar.gz app/Madeira/i386-windows
     ;;
   *) echo 'Unknown dependency' >&2; exit 2 ;;
 esac

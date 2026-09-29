@@ -5,12 +5,12 @@ on:
       component:
         description: Dependency to build
         type: choice
-        options: [all, fex, llvm, wine]
+        options: [all, fex, llvm, wine, i386]
         default: all
   workflow_call:
     inputs:
       component:
-        description: Dependency to build (all, fex, llvm or wine)
+        description: Dependency to build (all, fex, llvm, wine or i386)
         type: string
         default: all
 permissions:
@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: ${{ fromJSON(inputs.component == 'all' && '["fex","llvm","wine"]' || format('["{0}"]', inputs.component)) }}
+        component: ${{ fromJSON(inputs.component == 'all' && '["fex","llvm","wine","i386"]' || format('["{0}"]', inputs.component)) }}
     env:
       HOMEBREW_NO_AUTO_UPDATE: '1'
     steps:
@@ -49,6 +49,9 @@ jobs:
           if [ '${{ matrix.component }}' = wine ]; then
             brew install bison llvm gnutls pkg-config
           fi
+          if [ '${{ matrix.component }}' = i386 ]; then
+            brew install bison meson pkg-config
+          fi
       - name: Build dependency
         if: steps.llvm-cache.outputs.cache-hit != 'true'
         run: |
@@ -68,5 +71,8 @@ jobs:
             build/win32u-unix/obj/*.err
             build/wineserver/obj/err-*.txt
             wine/build-macos/config.log
+            wine/build-i386/config.log
+            wine/build-i386/madeira-i386-build.log
+            research/dxmt/build-pe-i386/meson-logs/meson-log.txt
           if-no-files-found: error
           retention-days: 14
