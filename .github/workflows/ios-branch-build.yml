@@ -6,7 +6,7 @@ name: Build Madeira iPhone package (branch validation)
 # The head commit message selects what runs:
 #   [ci-deps:fex] [ci-deps:llvm] [ci-deps:wine] [ci-deps:i386]  just that dependency
 #   [ci-app]     assemble the IPA from earlier runs' dependency artifacts
-#   (neither)    the full build, dependencies included
+#   (neither)    the full build, dependencies included (FEX, LLVM, Wine, i386)
 on:
   push:
     branches: [claude/dazzling-mccarthy-7x4b15]

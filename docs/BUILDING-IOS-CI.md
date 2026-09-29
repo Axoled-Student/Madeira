@@ -13,10 +13,10 @@ finishes, download the `Madeira-iPhone` artifact (kept 30 days).
 | Input | Meaning |
 |---|---|
 | `configuration` | `Debug` (default) or `Release`. `docs/BUILDING.md` records that Release builds have crashed the guest, so Debug is the default. |
-| `fex_run`, `llvm_run`, `wine_run` | Optional. A run ID whose `ios-fex` / `ios-llvm` / `ios-wine` artifact to reuse. Left blank, that dependency is built in the same run. |
+| `fex_run`, `llvm_run`, `wine_run`, `i386_run` | Optional. A run ID whose `ios-fex` / `ios-llvm` / `ios-wine` / `ios-i386` artifact to reuse. Left blank, that dependency is built in the same run. |
 
-`Build iOS dependencies` can also be run on its own (`all`, `fex`, `llvm` or
-`wine`); its artifacts are what the run-ID inputs above refer to. The LLVM
+`Build iOS dependencies` can also be run on its own (`all`, `fex`, `llvm`,
+`wine` or `i386`); its artifacts are what the run-ID inputs above refer to. The LLVM
 build is cached on the hash of `scripts/ci-build-llvm.sh`, so a rebuild after
 an unrelated change skips it.
 
@@ -32,6 +32,11 @@ an unrelated change skips it.
 - **Wine unix side**: `libwineserver.a` (bootstrapped from source, since the
   base archive is a git-ignored output), `libntdll_unix.a`, `libwin32u_unix.a`,
   FreeType, and the FFmpeg archives.
+- **The 32-bit farm** (`app/Madeira/i386-windows`): `build/wine-i386/build.sh`,
+  every i386 Wine module plus DXMT's i386 `d3d9`, `d3d11`, `dxgi`, `d3d10core`
+  and `winemetal`. A 32-bit game needs it: without it the app logs
+  `PE probe: machine=0x14c (i386, but the bundle has no i386-windows)` and
+  aborts in `build_wow64_parameters`.
 - **The app**: DXMT (`libdxmt_combined.a`, with the `air_*` shader headers
   generated as DXMT's own meson build does), Madeira Dock (`dockhost.exe`), the
   staged licence copies, then `xcodebuild`.
@@ -53,7 +58,6 @@ its file is on the default branch.
 
 ## Not covered
 
-- The 32-bit `i386-windows` Wine farm (`build/wine-i386/build.sh`) is not built.
 - The IPA is unsigned and carries no entitlements. Sign it with your own Apple
   ID in a sideloading tool; `Madeira.entitlements` is in the artifact.
   Development signing provides `get-task-allow`, which StikDebug's JIT needs.
