@@ -1,0 +1,19 @@
+name: Auto release branch test
+# Temporary: workflows are only started from the default branch, so this runs
+# auto-release.yml on this branch when a commit message contains [auto-release-test].
+on:
+  push:
+    branches: [claude/dazzling-mccarthy-7x4b15]
+permissions:
+  contents: write
+  actions: read
+  statuses: write
+jobs:
+  run:
+    if: contains(github.event.head_commit.message, '[auto-release-test]')
+    uses: ./.github/workflows/auto-release.yml
+    with:
+      draft: true
+      keep: 0
+      sync_upstream: ${{ !contains(github.event.head_commit.message, '[nosync]') }}
+      force: ${{ contains(github.event.head_commit.message, '[force]') }}

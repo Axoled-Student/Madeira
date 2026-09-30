@@ -2,6 +2,9 @@ name: Build Madeira iPhone package
 on:
   workflow_call:
     inputs:
+      ref:
+        type: string
+        default: ''
       configuration:
         type: string
         default: Debug
@@ -19,6 +22,10 @@ on:
         default: ''
   workflow_dispatch:
     inputs:
+      ref:
+        description: Commit or branch to build (blank builds the selected ref)
+        required: false
+        type: string
       configuration:
         description: Xcode configuration (docs/BUILDING.md - Release builds have crashed the guest)
         type: choice
@@ -50,21 +57,25 @@ jobs:
     uses: ./.github/workflows/ios-dependencies.yml
     with:
       component: fex
+      ref: ${{ inputs.ref }}
   llvm:
     if: ${{ inputs.llvm_run == '' }}
     uses: ./.github/workflows/ios-dependencies.yml
     with:
       component: llvm
+      ref: ${{ inputs.ref }}
   wine:
     if: ${{ inputs.wine_run == '' }}
     uses: ./.github/workflows/ios-dependencies.yml
     with:
       component: wine
+      ref: ${{ inputs.ref }}
   i386:
     if: ${{ inputs.i386_run == '' }}
     uses: ./.github/workflows/ios-dependencies.yml
     with:
       component: i386
+      ref: ${{ inputs.ref }}
   app:
     needs: [fex, llvm, wine, i386]
     # A skipped dependency job (reused run) is fine; a failed one is not.
@@ -75,6 +86,8 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: actions/download-artifact@v4
         with:
           name: ios-fex

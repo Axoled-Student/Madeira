@@ -16,16 +16,18 @@ case "$component" in
     MADEIRA_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
     git submodule update --init --depth 1 FEX
     # Fixes the native iOS build needs. Tolerate a FEX revision that already
-    # carries one of them.
+    # carries one of them, or that has changed the code so it no longer applies
+    # (the build then shows whether it was still needed).
     #  - diagnostics: keep the Windows-only diagnostics out of the native build.
     #  - allocator-guard: the no-allocator branch of AllocatorHooks.cpp called a
     #    macro that is only defined in the allocator branch.
     for patch in fex-native-diagnostics fex-native-allocator-guard; do
       if git -C FEX apply --reverse --check "$MADEIRA_ROOT/patches/$patch.patch" 2>/dev/null; then
         echo "FEX already carries $patch.patch"
-      else
-        git -C FEX apply --check "$MADEIRA_ROOT/patches/$patch.patch"
+      elif git -C FEX apply --check "$MADEIRA_ROOT/patches/$patch.patch" 2>/dev/null; then
         git -C FEX apply "$MADEIRA_ROOT/patches/$patch.patch"
+      else
+        echo "::warning::$patch.patch does not apply to this FEX revision; building without it"
       fi
     done
     git -C FEX submodule update --init --depth 1 --jobs 3 \

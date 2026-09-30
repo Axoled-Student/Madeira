@@ -1,0 +1,173 @@
+name: Auto release
+# Every day (and on demand): merge the newest upstream, move the submodules to their
+# newest branch tips, build the IPA when that is a commit not yet released, and
+# publish it as a GitHub Release. Scheduled and manually started workflows run only
+# from the default branch, so this file has to be on it.
+on:
+  schedule:
+    - cron: '41 2 * * *'
+  workflow_dispatch:
+    inputs:
+      sync_upstream:
+        description: Merge the newest upstream commits first
+        type: boolean
+        default: true
+      update_submodules:
+        description: Move the submodules to the newest tip of their branches
+        type: boolean
+        default: true
+      force:
+        description: Build and release even if this commit already has a release or a failed build
+        type: boolean
+        default: false
+      draft:
+        description: Publish a draft release only you can see
+        type: boolean
+        default: false
+      keep:
+        description: Automatic releases to keep, older ones are deleted (0 keeps all)
+        type: number
+        default: 10
+      build_run:
+        description: Publish the IPA of this earlier run instead of building (its commit must be the one being released)
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      sync_upstream:
+        type: boolean
+        default: true
+      update_submodules:
+        type: boolean
+        default: true
+      force:
+        type: boolean
+        default: false
+      draft:
+        type: boolean
+        default: false
+      keep:
+        type: number
+        default: 10
+      build_run:
+        type: string
+        default: ''
+    secrets:
+      AUTO_SYNC_TOKEN:
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+jobs:
+  prepare:
+    name: Sync sources
+    if: ${{ github.ref_type == 'branch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      statuses: read
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # AUTO_SYNC_TOKEN (optional secret, a personal access token with contents and
+      # workflow write) lets upstream changes to .github/workflows be merged too.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          token: ${{ secrets.AUTO_SYNC_TOKEN || github.token }}
+      - name: Merge upstream and update submodules
+        id: sync
+        env:
+          MADEIRA_SYNC_UPSTREAM: ${{ format('{0}', inputs.sync_upstream) == 'false' && '0' || '1' }}
+          MADEIRA_UPDATE_SUBMODULES: ${{ format('{0}', inputs.update_submodules) == 'false' && '0' || '1' }}
+          MADEIRA_ALLOW_WORKFLOW_CHANGES: ${{ secrets.AUTO_SYNC_TOKEN != '' && '1' || '0' }}
+        run: |
+          echo '### Sources' >> "$GITHUB_STEP_SUMMARY"
+          bash scripts/ci-sync.sh
+      - name: Push the synced branch
+        if: steps.sync.outputs.changed == 'true'
+        run: git push origin "HEAD:refs/heads/${{ github.ref_name }}"
+      - name: Decide whether to build
+        id: decide
+        env:
+          SHA: ${{ steps.sync.outputs.sha }}
+          FORCE: ${{ format('{0}', inputs.force) == 'true' || inputs.build_run != '' }}
+        run: |
+          released="$(gh release list --limit 200 --json tagName --jq '.[].tagName' | grep -c -- "-${SHA:0:7}$" || true)"
+          failed="$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/statuses" \
+            --jq '[.[] | select(.context == "auto-release")][0].state // empty')"
+          if [ "$FORCE" = true ]; then
+            build=true; why='forced'
+          elif [ "$released" -gt 0 ]; then
+            build=false; why='this commit already has a release'
+          elif [ "$failed" = failure ]; then
+            build=false; why='the last build of this commit failed; fix the sources or run with force'
+          else
+            build=true; why='no release for this commit yet'
+          fi
+          echo "should_build=$build" >> "$GITHUB_OUTPUT"
+          echo "- Build: $build ($why)." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build
+    needs: prepare
+    if: ${{ needs.prepare.outputs.should_build == 'true' && inputs.build_run == '' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/ios-app.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    if: ${{ !failure() && !cancelled() && needs.prepare.outputs.should_build == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: Madeira-iPhone
+          run-id: ${{ inputs.build_run || github.run_id }}
+          github-token: ${{ github.token }}
+          path: dist
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          MADEIRA_DRAFT: ${{ format('{0}', inputs.draft) == 'true' && '1' || '0' }}
+          MADEIRA_KEEP: ${{ format('{0}', inputs.keep) == '' && '10' || inputs.keep }}
+        run: bash scripts/ci-release.sh
+
+  # Marks the built commit, so a commit whose build failed is not rebuilt every day.
+  result:
+    name: Record result
+    needs: [prepare, build, publish]
+    if: ${{ !cancelled() && needs.prepare.outputs.should_build == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          PUBLISHED: ${{ needs.publish.result }}
+        run: |
+          state=failure; text='Build or release failed'
+          if [ "$PUBLISHED" = success ]; then state=success; text='Built and released'; fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$state" \
+            -f context=auto-release -f description="$text" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

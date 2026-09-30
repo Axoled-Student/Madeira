@@ -7,12 +7,20 @@ on:
         type: choice
         options: [all, fex, llvm, wine, i386]
         default: all
+      ref:
+        description: Commit or branch to build (blank builds the selected ref)
+        required: false
+        type: string
   workflow_call:
     inputs:
       component:
         description: Dependency to build (all, fex, llvm, wine or i386)
         type: string
         default: all
+      ref:
+        description: Commit or branch to build (blank builds the caller's ref)
+        type: string
+        default: ''
 permissions:
   contents: read
 jobs:
@@ -28,6 +36,8 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       # LLVM is by far the longest build and changes only with its own recipe.
       - name: Restore LLVM build
         if: matrix.component == 'llvm'
