@@ -161,7 +161,8 @@ jobs:
     permissions:
       statuses: write
     steps:
-      - env:
+      - name: Set the auto-release status on the commit
+        env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ needs.prepare.outputs.sha }}
           PUBLISHED: ${{ needs.publish.result }}
