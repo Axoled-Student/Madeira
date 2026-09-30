@@ -17,7 +17,7 @@ sha7="${SHA:0:7}"
 tag="build-$(date -u +%Y%m%d)-$sha7"
 tag_re='^build-[0-9]{8}-[0-9a-f]{7}$'
 
-ipa="$(find "$DIST" -name Madeira-unsigned.ipa -type f | head -n 1)"
+ipa="$(find "$DIST" -name Madeira-unsigned.ipa -type f -print -quit)"
 [ -n "$ipa" ] || { echo "No Madeira-unsigned.ipa under $DIST" >&2; exit 1; }
 artifact_dir="$(dirname "$ipa")"
 
@@ -50,7 +50,8 @@ trap 'rm -f "$notes"' EXIT
   if [ -n "$prev_tag" ] && git rev-parse -q --verify "$prev_tag^{commit}" >/dev/null; then
     echo
     echo "### Changes since \`$prev_tag\`"
-    git log --no-merges --pretty='- %h %s' "$prev_tag..$SHA" | head -n 40
+    git log --no-merges --pretty='- %h %s' -n 40 "$prev_tag..$SHA"
+    echo "- ... $(git rev-list --count --no-merges "$prev_tag..$SHA") commit(s) in all"
     git diff --raw "$prev_tag" "$SHA" \
       | awk '$1 == ":160000" && $2 == "160000" { print "- `" $6 "` " substr($3, 1, 7) " -> " substr($4, 1, 7) }'
   fi

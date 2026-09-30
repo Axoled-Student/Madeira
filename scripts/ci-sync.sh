@@ -31,7 +31,7 @@ warn() {
 
 sync_upstream() {
   local branch up before
-  branch="$(git ls-remote --symref "$MADEIRA_UPSTREAM" HEAD | awk '/^ref:/ { sub("refs/heads/", "", $2); print $2; exit }')"
+  branch="$(git ls-remote --symref "$MADEIRA_UPSTREAM" HEAD | awk '/^ref:/ && !seen { sub("refs/heads/", "", $2); print $2; seen = 1 }')"
   branch="${branch:-main}"
   git fetch --quiet --no-tags "$MADEIRA_UPSTREAM" "$branch"
   up="$(git rev-parse FETCH_HEAD)"
