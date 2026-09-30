@@ -10,5 +10,7 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/ci-fetch-vcruntime.sh
+      - run: bash scripts/ci-fetch-vcruntime.sh x64
+      - run: bash scripts/ci-fetch-vcruntime.sh x86
       - run: ls -l app/Madeira/x86_64-vcruntime
+      - run: git status --short app/Madeira/i386-windows | head

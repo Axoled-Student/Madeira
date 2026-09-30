@@ -41,6 +41,16 @@ an unrelated change skips it.
   generated as DXMT's own meson build does), Madeira Dock (`dockhost.exe`), the
   staged licence copies, then `xcodebuild`.
 
+- **Microsoft's Visual C++ runtime**, unmodified, from Microsoft's own
+  `vc_redist.x64.exe` and `vc_redist.x86.exe` (`scripts/ci-fetch-vcruntime.sh`).
+  The x64 set goes to `app/Madeira/x86_64-vcruntime` and the x86 set to
+  `app/Madeira/i386-windows`, replacing Wine's builtin of the same name there (the
+  app links the farm into `syswow64` as it is; it applies its own exemptions to the
+  x64 set). Each DLL is checked to be a signed PE of the right machine type, and the
+  SHA-256 of each is in the artifact (`vcruntime-x64-sha256.txt`,
+  `vcruntime-x86-sha256.txt`). The DLLs stay under Microsoft's terms, which is
+  why the repository does not commit them; `bundle_vcruntime: false` leaves them out.
+
 The Wine PE modules under `app/Madeira/*-windows` and the GnuTLS archives are
 the ones committed to the repository; they are not rebuilt.
 
@@ -99,6 +109,5 @@ release is made and the previous one stays the latest.
 - The IPA is unsigned and carries no entitlements. Sign it with your own Apple
   ID in a sideloading tool; `Madeira.entitlements` is in the artifact.
   Development signing provides `get-task-allow`, which StikDebug's JIT needs.
-- The Microsoft VC++ runtime DLLs are not bundled (`tools/fetch-vcruntime.md`).
 - A successful build establishes that everything compiles, links and packages.
   It does not establish game compatibility or on-device stability.

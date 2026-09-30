@@ -56,7 +56,8 @@ LLVM_MINGW="$MADEIRA_MINGW_BIN" bash build/madeira-dock/build.sh
 mkdir -p app/Madeira/x86_64-vcruntime
 MADEIRA_BUNDLE_VCRUNTIME="${MADEIRA_BUNDLE_VCRUNTIME:-1}"
 if [ "$MADEIRA_BUNDLE_VCRUNTIME" = 1 ]; then
-  bash scripts/ci-fetch-vcruntime.sh
+  bash scripts/ci-fetch-vcruntime.sh x64
+  bash scripts/ci-fetch-vcruntime.sh x86
 else
   cp tools/fetch-vcruntime.md app/Madeira/x86_64-vcruntime/README.md
 fi
@@ -80,6 +81,9 @@ test -s "$MADEIRA_APP/d3d12/libmetalirconverter.dylib"
 if [ "$MADEIRA_BUNDLE_VCRUNTIME" = 1 ]; then
   for module in vcruntime140.dll vcruntime140_1.dll msvcp140.dll; do
     test -s "$MADEIRA_APP/x86_64-vcruntime/$module"
+  done
+  for module in vcruntime140.dll msvcp140.dll; do
+    test -s "$MADEIRA_APP/i386-windows/$module"
   done
 fi
 # The 32-bit farm: without i386-windows/ntdll.dll a 32-bit target is never treated
@@ -124,8 +128,10 @@ The package contains the Wine PE modules committed to the repository and
 source-built iOS libraries (FEX, Wine unix side, FFmpeg, DXMT, Madeira Dock).
 The 32-bit (i386-windows) Wine farm is included, so 32-bit games can start.
 $(if [ "$MADEIRA_BUNDLE_VCRUNTIME" = 1 ]; then
-  echo "Microsoft's Visual C++ x64 runtime DLLs (vcruntime-sha256.txt) are bundled unmodified,"
-  echo "as taken from Microsoft's vc_redist.x64.exe; they stay under Microsoft's terms."
+  echo "Microsoft's Visual C++ runtime DLLs are bundled unmodified (vcruntime-x64-sha256.txt,"
+  echo "vcruntime-x86-sha256.txt), taken from Microsoft's vc_redist installers: x64 in"
+  echo "x86_64-vcruntime, x86 in i386-windows over Wine's builtins of the same name."
+  echo "They stay under Microsoft's terms."
 else
   echo "Microsoft's Visual C++ redistributable DLLs are not bundled; see fetch-vcruntime.md."
 fi)
