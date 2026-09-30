@@ -51,9 +51,15 @@ madeira_fetch_llvm_mingw
 LLVM_MINGW="$MADEIRA_MINGW_BIN" bash build/madeira-dock/build.sh
 
 # The project declares this folder as a resource but the Microsoft runtime DLLs
-# are separately licensed and never committed. Keep the folder present.
+# are separately licensed and never committed. Fetch them from Microsoft's own
+# installer (MADEIRA_BUNDLE_VCRUNTIME=0 leaves the folder with only its README).
 mkdir -p app/Madeira/x86_64-vcruntime
-cp tools/fetch-vcruntime.md app/Madeira/x86_64-vcruntime/README.md
+MADEIRA_BUNDLE_VCRUNTIME="${MADEIRA_BUNDLE_VCRUNTIME:-1}"
+if [ "$MADEIRA_BUNDLE_VCRUNTIME" = 1 ]; then
+  bash scripts/ci-fetch-vcruntime.sh
+else
+  cp tools/fetch-vcruntime.md app/Madeira/x86_64-vcruntime/README.md
+fi
 # The Xcode build fails when the bundled licence copies are missing or stale.
 bash build/stage-licenses.sh
 
@@ -71,6 +77,11 @@ for module in xtajit64.dll d3d11.dll winemetal.dll dockhost.exe; do
   test -s "$MADEIRA_APP/arm64ec-windows/$module"
 done
 test -s "$MADEIRA_APP/d3d12/libmetalirconverter.dylib"
+if [ "$MADEIRA_BUNDLE_VCRUNTIME" = 1 ]; then
+  for module in vcruntime140.dll vcruntime140_1.dll msvcp140.dll; do
+    test -s "$MADEIRA_APP/x86_64-vcruntime/$module"
+  done
+fi
 # The 32-bit farm: without i386-windows/ntdll.dll a 32-bit target is never treated
 # as one (docs/WOW64.md), and d3d9.dll is what a 32-bit D3D9 game loads.
 for module in ntdll.dll kernel32.dll d3d9.dll d3d9-emulated.dll d3d11.dll winemetal.dll; do
@@ -112,7 +123,11 @@ project's StikDebug workflow before game use.
 The package contains the Wine PE modules committed to the repository and
 source-built iOS libraries (FEX, Wine unix side, FFmpeg, DXMT, Madeira Dock).
 The 32-bit (i386-windows) Wine farm is included, so 32-bit games can start.
-Microsoft's optional Visual C++ redistributable DLLs are not bundled; see
-fetch-vcruntime.md.
+$(if [ "$MADEIRA_BUNDLE_VCRUNTIME" = 1 ]; then
+  echo "Microsoft's Visual C++ x64 runtime DLLs (vcruntime-sha256.txt) are bundled unmodified,"
+  echo "as taken from Microsoft's vc_redist.x64.exe; they stay under Microsoft's terms."
+else
+  echo "Microsoft's Visual C++ redistributable DLLs are not bundled; see fetch-vcruntime.md."
+fi)
 Compilation and archive validation do not establish on-device compatibility.
 EOF

@@ -1,0 +1,14 @@
+name: VC runtime fetch test
+# Temporary: runs scripts/ci-fetch-vcruntime.sh on its own when a commit message
+# contains [vcruntime-test].
+on:
+  push:
+    branches: [claude/dazzling-mccarthy-7x4b15]
+jobs:
+  fetch:
+    if: contains(github.event.head_commit.message, '[vcruntime-test]')
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/ci-fetch-vcruntime.sh
+      - run: ls -l app/Madeira/x86_64-vcruntime

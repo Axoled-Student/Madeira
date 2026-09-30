@@ -32,6 +32,10 @@ on:
         description: Publish the IPA of this earlier run instead of building (its commit must be the one being released)
         type: string
         default: ''
+      bundle_vcruntime:
+        description: Bundle Microsoft's Visual C++ x64 runtime DLLs in the IPA (untick for a release you make public)
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       sync_upstream:
@@ -52,6 +56,9 @@ on:
       build_run:
         type: string
         default: ''
+      bundle_vcruntime:
+        type: boolean
+        default: true
     secrets:
       AUTO_SYNC_TOKEN:
         required: false
@@ -124,6 +131,7 @@ jobs:
     uses: ./.github/workflows/ios-app.yml
     with:
       ref: ${{ needs.prepare.outputs.sha }}
+      bundle_vcruntime: ${{ format('{0}', inputs.bundle_vcruntime) != 'false' }}
 
   publish:
     name: Publish release

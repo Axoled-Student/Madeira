@@ -8,6 +8,9 @@ on:
       configuration:
         type: string
         default: Debug
+      bundle_vcruntime:
+        type: boolean
+        default: true
       fex_run:
         type: string
         default: ''
@@ -31,6 +34,10 @@ on:
         type: choice
         options: [Debug, Release]
         default: Debug
+      bundle_vcruntime:
+        description: Bundle Microsoft's Visual C++ x64 runtime DLLs, taken unmodified from Microsoft's installer
+        type: boolean
+        default: true
       fex_run:
         description: Run containing ios-fex to reuse (blank builds FEX in this run)
         required: false
@@ -115,6 +122,7 @@ jobs:
       - name: Build and package
         env:
           MADEIRA_CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+          MADEIRA_BUNDLE_VCRUNTIME: ${{ format('{0}', inputs.bundle_vcruntime) == 'false' && '0' || '1' }}
         run: |
           mkdir -p ci-output
           set -o pipefail
