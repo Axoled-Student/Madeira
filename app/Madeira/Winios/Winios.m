@@ -32,6 +32,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* The window census struct is shared with Swift through this header;
+ * including it here keeps both sides' definitions the same. */
+#include "Winios.h"
+
 /* csops syscall — CS_DEBUGGED is the flag StikDebug JIT rides on. Declared by
  * hand for the same reason JITAllocator.c does: <sys/codesign.h> is not in the
  * iOS SDK's public headers. */
@@ -366,8 +370,202 @@ BOOL winios_pCreateWindow(HWND hwnd) {
 
 static void winios_remove_layer(HWND hwnd);   /* compositor, below */
 
+/* ============================================================ *
+ * Top-level window census (see Winios.h)
+ * ============================================================
+ *
+ * A game started through Madeira Dock runs in a desktop session: explorer,
+ * the Dock host's console window, Valve's client inside the host, and the
+ * game's one-time installers can all put windows up before the game does,
+ * each from a different thread. Nothing on the app side could tell those
+ * apart, so the starting screen went away on the desktop's first GDI frame.
+ *
+ * The one fact that separates them generically is WHICH PROGRAM owns the
+ * window, and where that program lives on drive C. win32u knows the owning
+ * process id and the server knows every process's image path
+ * (SystemProcessIdInformation asks it by id without opening a handle). Both
+ * are read on the Wine thread inside the WindowPosChanged hook
+ * (winios_drv_census_owner / winios_drv_process_image in driver_ios.c); each
+ * process's path is looked up once. The app decides what the paths mean.
+ *
+ * Only while the app has switched it on (winios_window_census_enable), so a
+ * normal session never pays a lookup. */
+#define WINIOS_WS_VISIBLE    0x10000000u
+#define WINIOS_WS_MINIMIZE   0x20000000u
+
+extern int winios_drv_census_owner(HWND hwnd, unsigned int *pid, unsigned int *style);
+extern int winios_drv_process_image(unsigned int pid, char *out, unsigned int size);
+extern int winios_drv_post_restore(HWND hwnd);
+extern int winios_drv_foreground_if_owner(HWND hwnd);
+
+/* A game's main window can be shown minimized the first time it is shown
+ * (ShowWindow cmd 2, parked at -32000,-32000). On Windows the taskbar brings
+ * it back; Madeira has no taskbar, so the starting screen waited for a window
+ * that never appeared. While the census runs, a top-level window whose first
+ * show is minimized is sent what a taskbar click sends: WM_SYSCOMMAND/
+ * SC_RESTORE, once. A window that was shown and later minimized itself (e.g.
+ * on losing focus) is left alone. MADEIRA_RESTORE_BORN_MINIMIZED=0 turns this
+ * off. Restored, such a window was shown but its game stayed idle (a
+ * fullscreen game pauses without focus): a taskbar click also brings the
+ * window to the front, which its own thread does from its event pump
+ * (g_restore_foreground, winios_pProcessEvents). */
+static _Atomic(uintptr_t) g_restore_foreground;
+static int winios_restore_born_minimized_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("MADEIRA_RESTORE_BORN_MINIMIZED"); enabled = !(e && e[0] == '0'); }   /* 0: while a Dock start's census runs, a window first shown minimized stays minimized */
+    return enabled;
+}
+
+static pthread_mutex_t g_census_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_census_on;
+static struct winios_census_window g_census[WINIOS_CENSUS_MAX];
+static int g_census_n;
+#define WINIOS_CENSUS_IMAGES 48
+static struct { unsigned int pid; int known; char image[WINIOS_CENSUS_IMAGE]; } g_census_images[WINIOS_CENSUS_IMAGES];
+static int g_census_images_n;
+static _Atomic unsigned g_census_failures;
+
+/* The owning program's executable path (see Winios.h), "" when the server
+ * could not name it. Cached per process id for the census's lifetime.
+ * Wine thread only (the lookup is a server call). */
+static int winios_census_image(unsigned int pid, char out[WINIOS_CENSUS_IMAGE]) {
+    out[0] = 0;
+    if (!pid) return 0;
+    pthread_mutex_lock(&g_census_lock);
+    for (int i = 0; i < g_census_images_n; i++) {
+        if (g_census_images[i].pid != pid) continue;
+        memcpy(out, g_census_images[i].image, WINIOS_CENSUS_IMAGE);
+        int known = g_census_images[i].known;
+        pthread_mutex_unlock(&g_census_lock);
+        return known;
+    }
+    pthread_mutex_unlock(&g_census_lock);
+
+    int known = winios_drv_process_image(pid, out, WINIOS_CENSUS_IMAGE);
+    if (!known) {
+        out[0] = 0;
+        if (atomic_fetch_add(&g_census_failures, 1) < 4) {
+            fprintf(stderr, "[window-census] no image path for pid %04x\n", pid);
+            fflush(stderr);
+        }
+    }
+    pthread_mutex_lock(&g_census_lock);
+    if (g_census_images_n < WINIOS_CENSUS_IMAGES) {
+        g_census_images[g_census_images_n].pid = pid;
+        g_census_images[g_census_images_n].known = known;
+        memcpy(g_census_images[g_census_images_n].image, out, WINIOS_CENSUS_IMAGE);
+        g_census_images_n++;
+    }
+    pthread_mutex_unlock(&g_census_lock);
+    return known;
+}
+
+/* Caller holds g_census_lock. */
+static struct winios_census_window *winios_census_find(HWND hwnd) {
+    for (int i = 0; i < g_census_n; i++)
+        if (g_census[i].hwnd == (unsigned long long)(uintptr_t)hwnd) return &g_census[i];
+    return NULL;
+}
+
+/* Wine thread, from winios_window_frame (the WindowPosChanged hook, which runs
+ * on the window's own thread). Records top-level windows only. */
+static void winios_census_note_frame(HWND hwnd, int x, int y, int w, int h, int visible) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed) || !hwnd) return;
+    /* win32u calls stay outside the census lock: they take win32u's own. */
+    unsigned int pid = 0, style = 0;
+    if (!winios_drv_census_owner(hwnd, &pid, &style)) return;
+    char image[WINIOS_CENSUS_IMAGE];
+    winios_census_image(pid, image);
+    int shown = visible && (style & WINIOS_WS_VISIBLE) && !(style & WINIOS_WS_MINIMIZE) && w > 0 && h > 0;
+    int born_minimized = 0;
+
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (!e && g_census_n < WINIOS_CENSUS_MAX) e = &g_census[g_census_n++];
+    if (!e && shown) {
+        /* Full: reuse a hidden window's slot rather than lose a shown one. */
+        for (int i = 0; i < g_census_n && !e; i++) if (!g_census[i].visible) e = &g_census[i];
+    }
+    if (e) {
+        if (e->hwnd != (unsigned long long)(uintptr_t)hwnd) memset(e, 0, sizeof(*e));
+        e->hwnd = (unsigned long long)(uintptr_t)hwnd;
+        e->x = x; e->y = y; e->w = w; e->h = h;
+        e->pid = pid;
+        e->visible = (unsigned char)shown;
+        memcpy(e->image, image, sizeof(e->image));
+        if (shown) e->shown_once = 1;
+        else if ((style & WINIOS_WS_VISIBLE) && (style & WINIOS_WS_MINIMIZE) && !e->shown_once && !e->restore_sent &&
+                 winios_restore_born_minimized_enabled()) {
+            e->restore_sent = 1;
+            born_minimized = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_census_lock);
+    if (born_minimized) {
+        /* Posted, not sent: this runs inside the window's WindowPosChanged. */
+        int ok = winios_drv_post_restore(hwnd);
+        atomic_store(&g_restore_foreground, (uintptr_t)hwnd);
+        fprintf(stderr, "[born-minimized] hwnd=%p pid=%04x restore-posted=%d "
+                        "(MADEIRA_RESTORE_BORN_MINIMIZED=0 leaves it minimized)\n", hwnd, pid, ok ? 1 : 0);
+        fflush(stderr);
+    }
+}
+
+/* Wine thread, from the GDI flush: count frames of listed windows only. */
+static void winios_census_note_present(HWND hwnd) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (e && e->presents < 0xffffffffu) e->presents++;
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+/* A desktop-mode swapchain was made for this window (any thread). A swapchain
+ * on a child window is not listed; the app also watches DXMT's present count. */
+static void winios_census_note_metal(HWND hwnd) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (e) e->metal = 1;
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+static void winios_census_forget(HWND hwnd) {
+    if (!atomic_load_explicit(&g_census_on, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_census_lock);
+    struct winios_census_window *e = winios_census_find(hwnd);
+    if (e) { *e = g_census[--g_census_n]; memset(&g_census[g_census_n], 0, sizeof(g_census[0])); }
+    pthread_mutex_unlock(&g_census_lock);
+}
+
+void winios_window_census_enable(int on) {
+    pthread_mutex_lock(&g_census_lock);
+    int was = atomic_load(&g_census_on);
+    g_census_n = 0;
+    g_census_images_n = 0;
+    memset(g_census, 0, sizeof(g_census));
+    atomic_store(&g_census_on, on ? 1 : 0);
+    pthread_mutex_unlock(&g_census_lock);
+    if (!was != !on) {
+        fprintf(stderr, "[window-census] %s\n", on ? "on" : "off");
+        fflush(stderr);
+    }
+}
+
+int winios_window_census(struct winios_census_window *out, int max) {
+    if (!out || max <= 0) return 0;
+    pthread_mutex_lock(&g_census_lock);
+    int n = g_census_n < max ? g_census_n : max;
+    memcpy(out, g_census, (size_t)n * sizeof(*out));
+    pthread_mutex_unlock(&g_census_lock);
+    return n;
+}
+
 void winios_pDestroyWindow(HWND hwnd) {
     WLOG("pDestroyWindow hwnd=%p", hwnd);
+    uintptr_t pending = (uintptr_t)hwnd;
+    atomic_compare_exchange_strong(&g_restore_foreground, &pending, 0);
+    winios_census_forget(hwnd);
     winios_remove_layer(hwnd);
 }
 
@@ -522,6 +720,16 @@ void winios_post_key(int vk, int down) {
 }
 
 BOOL winios_pProcessEvents(DWORD mask) {
+    /* The restored born-minimized window's own thread brings it to the front
+     * (see g_restore_foreground); other threads leave the request in place. */
+    uintptr_t fg = atomic_load_explicit(&g_restore_foreground, memory_order_relaxed);
+    if (fg) {
+        int r = winios_drv_foreground_if_owner((HWND)fg);
+        if (r && atomic_compare_exchange_strong(&g_restore_foreground, &fg, 0)) {
+            fprintf(stderr, "[born-minimized] hwnd=%p foreground=%d\n", (HWND)fg, r);
+            fflush(stderr);
+        }
+    }
     static unsigned int cnt;
     static int quiet = -1;
     if (quiet < 0) quiet = getenv("MADEIRA_QUIET") != NULL;
@@ -581,6 +789,10 @@ static NSMutableDictionary<NSNumber *, NSValue *> *g_px_rects;  /* hwnd → last
 static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_sizes; /* hwnd → surface px size */
 static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → DXMT layer */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd → client px rect */
+/* Desktop fit state (winios_desktop_fit below), main thread only. */
+static NSNumber *g_fit_key;
+static CGRect g_fit_client_px;   /* the window's client rect, desktop px */
+static CGRect g_fit_view_pt;     /* where it is shown, compositor-view points */
 static void winios_place_metal_layer(NSNumber *key);
 
 /* Surfaces are 128px-aligned (win32u), usually LARGER than the window.
@@ -605,16 +817,29 @@ unsigned long long winios_surface_present_count(void) {
     return atomic_load_explicit(&g_surface_present_count, memory_order_relaxed);
 }
 
+/* IOSDisplayShim.m: the guest's virtual monitor as win32u last published it
+ * (the session default until a program changes the display mode). */
+extern void winios_screen_size(int *w, int *h);
+extern NSString * const MadeiraDisplayModeChangedNotification;
+
 static UIView *g_compositor_view;
 static CALayer *g_desk_bg;               /* teal desktop-area backdrop */
-static CGFloat g_px_to_pt = 1.0 / 3.0;   /* desktop px → screen pt */
+static CGFloat g_px_to_pt = 1.0 / 3.0;   /* desktop px → screen pt (x, and y unless stretched) */
+static CGFloat g_px_to_pt_y;             /* y scale when the display mode stretches; 0 = same as x */
 static CGPoint g_desk_origin;            /* desktop (0,0) in view pt (letterbox offset) */
+/* The rect the front end laid the guest display out in (its Aspect / Fill /
+ * Stretch / Fit choice, GameSurfaceLayout), in compositor-view points. When
+ * set, the desktop is placed there instead of being aspect-fit into the
+ * whole frame, so the display-mode setting applies to desktop sessions too. */
+static CGRect g_desk_rect;
+static BOOL g_desk_rect_set;
+#define WINIOS_PX_TO_PT_Y (g_px_to_pt_y > 0 ? g_px_to_pt_y : g_px_to_pt)
 static CGRect g_comp_frame;              /* presentation area (window coords), from Swift */
 static BOOL g_comp_frame_set;
 
 static CGRect winios_layer_rect(int x, int y, int w, int h) {
-    CGFloat s = g_px_to_pt;
-    return CGRectMake(g_desk_origin.x + x * s, g_desk_origin.y + y * s, w * s, h * s);
+    CGFloat s = g_px_to_pt, sy = WINIOS_PX_TO_PT_Y;
+    return CGRectMake(g_desk_origin.x + x * s, g_desk_origin.y + y * sy, w * s, h * sy);
 }
 
 /* main thread only. Sizes the compositor to the presentation frame and
@@ -625,15 +850,32 @@ static void winios_layout_compositor(void) {
     CGRect frame = g_comp_frame_set ? g_comp_frame : (win ? win.bounds : g_compositor_view.frame);
     g_compositor_view.frame = frame;
 
-    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
-    int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+    /* The LIVE guest size, not MADEIRA_SCREEN_W/H. That environment pair is
+     * the session's launch-time seed; win32u owns the value afterwards and
+     * publishes every change through winios_display_mode_changed
+     * (IOSDisplayShim.m). Reading the seed kept letterboxing against the old
+     * size after a program programmed a different mode, so an 800x600 game
+     * stayed a small window inside a 1280x720 frame. */
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
     if (desk_w <= 0) desk_w = 1024;
     if (desk_h <= 0) desk_h = 768;
     CGFloat s = MIN(frame.size.width / desk_w, frame.size.height / desk_h);
     CGSize fit = CGSizeMake(desk_w * s, desk_h * s);
     g_px_to_pt = s;
+    g_px_to_pt_y = 0;
     g_desk_origin = CGPointMake((frame.size.width - fit.width) / 2,
                                 (frame.size.height - fit.height) / 2);
+    if (g_desk_rect_set && g_desk_rect.size.width >= 1 && g_desk_rect.size.height >= 1) {
+        /* The front end's display mode: Fit and Aspect keep the guest shape
+         * (uniform), Fill overflows the frame (clipped by the view), Stretch
+         * is the one anisotropic case. */
+        g_px_to_pt = g_desk_rect.size.width / desk_w;
+        CGFloat sy = g_desk_rect.size.height / desk_h;
+        if (fabs(sy - g_px_to_pt) > 0.0005) g_px_to_pt_y = sy;
+        g_desk_origin = g_desk_rect.origin;
+        fit = g_desk_rect.size;
+    }
     g_desk_bg.frame = CGRectMake(g_desk_origin.x, g_desk_origin.y, fit.width, fit.height);
 
     /* re-place existing window layers under the new mapping */
@@ -652,6 +894,20 @@ static void winios_layout_compositor(void) {
 
 /* Called from Swift (MetalBackedView) with the presentation area in
  * window coordinates — same geometry contract as the Metal host view. */
+/* Called from Swift (MetalBackedView.applyDisplayMode) with the rect its
+ * display mode laid the guest display out in, in the compositor view's own
+ * points (the compositor frame is that view's bounds). `set` 0 clears it and
+ * the desktop goes back to an aspect fit of the whole frame. */
+void winios_set_desktop_rect(double x, double y, double w, double h, int set) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CGRect r = CGRectMake(x, y, w, h);
+        if (g_desk_rect_set == (set != 0) && (!set || CGRectEqualToRect(g_desk_rect, r))) return;
+        g_desk_rect = r;
+        g_desk_rect_set = set != 0;
+        winios_layout_compositor();
+    });
+}
+
 void winios_set_compositor_frame(double x, double y, double w, double h) {
     dispatch_async(dispatch_get_main_queue(), ^{
         CGRect f = CGRectMake(x, y, w, h);
@@ -683,16 +939,26 @@ int winios_compositor_set_hidden(int hidden) {
  * mapping winios_layout_compositor placed the desktop with, for the front end's
  * Touch pointer mode in desktop sessions. Returns 0 when there is no desktop. */
 int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
-    const char *dw = getenv("MADEIRA_SCREEN_W"), *dh = getenv("MADEIRA_SCREEN_H");
-    int desk_w = dw ? atoi(dw) : 1024, desk_h = dh ? atoi(dh) : 768;
+    /* the live guest size, as winios_layout_compositor uses: the two must
+     * agree or a touch lands somewhere the desktop is not */
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
     if (desk_w <= 0) desk_w = 1024;
     if (desk_h <= 0) desk_h = 768;
     if (px) *px = 0;
     if (py) *py = 0;
     if (!g_compositor_view || g_px_to_pt <= 0) return 0;
     CGRect f = g_compositor_view.frame;
+    /* a tap on a fitted window (winios_desktop_fit) lands in that window's
+     * own client pixels */
+    if (g_fit_key && CGRectContainsPoint(g_fit_view_pt, CGPointMake(wx - f.origin.x, wy - f.origin.y))) {
+        CGFloat k = g_fit_client_px.size.width / g_fit_view_pt.size.width;
+        if (px) *px = (int)(g_fit_client_px.origin.x + (wx - f.origin.x - g_fit_view_pt.origin.x) * k);
+        if (py) *py = (int)(g_fit_client_px.origin.y + (wy - f.origin.y - g_fit_view_pt.origin.y) * k);
+        return 1;
+    }
     double x = (wx - f.origin.x - g_desk_origin.x) / g_px_to_pt;
-    double y = (wy - f.origin.y - g_desk_origin.y) / g_px_to_pt;
+    double y = (wy - f.origin.y - g_desk_origin.y) / WINIOS_PX_TO_PT_Y;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x > desk_w - 1) x = desk_w - 1;
@@ -721,9 +987,11 @@ static void winios_ensure_compositor(void) {
     g_compositor_view = [[UIView alloc] initWithFrame:win.bounds];
     g_compositor_view.userInteractionEnabled = NO;  /* touches fall through */
     g_compositor_view.clipsToBounds = YES;
-    /* letterbox area: near-black; desktop area: classic teal (until
-     * explorer's own background paint works) */
-    g_compositor_view.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
+    /* letterbox area: black, like the rest of a session's screen (the game
+     * view's host and the library's session view are black); an 8 % grey
+     * showed as grey bands around a fitted desktop. desktop area: classic
+     * teal (until explorer's own background paint works) */
+    g_compositor_view.backgroundColor = UIColor.blackColor;
     g_desk_bg = [CALayer layer];
     g_desk_bg.backgroundColor = [UIColor colorWithRed:0.0 green:0.502 blue:0.502 alpha:1.0].CGColor;
     [g_compositor_view.layer addSublayer:g_desk_bg];
@@ -731,6 +999,17 @@ static void winios_ensure_compositor(void) {
     winios_layout_compositor();
     fprintf(stderr, "[winios] compositor attached inside presentation frame\n");
     fflush(stderr);
+    /* A guest display-mode change moves the desktop's size without moving
+     * the presentation frame, so winios_set_compositor_frame (which skips a
+     * no-op frame) never notices it: re-fit the desktop when win32u
+     * publishes one (IOSDisplayShim posts this on the main queue). */
+    static id mode_observer;
+    if (!mode_observer) {
+        mode_observer = [[NSNotificationCenter defaultCenter]
+            addObserverForName:MadeiraDisplayModeChangedNotification object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) { winios_layout_compositor(); }];
+    }
     /* Wedged-thread triage: sample every thread's stack every 20s from
      * an app-side timer — keeps firing even when all wine threads are
      * stuck (unlike the tree dump, which rides wine's event drain). */
@@ -778,6 +1057,7 @@ static void winios_remove_layer(HWND hwnd) {
             [ml removeFromSuperlayer];
             [g_metal_layers removeObjectForKey:key];
             [g_client_rects removeObjectForKey:key];
+            if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
             fprintf(stderr, "[winios] metal layer removed for hwnd=%p\n", hwnd);
             fflush(stderr);
         }
@@ -796,6 +1076,55 @@ static void winios_remove_layer(HWND hwnd) {
  * Game (non-desktop) mode keeps the fullscreen singleton layer via
  * IOSDisplayShim — none of this runs. */
 
+/* DESKTOP FIT. A presenting window whose client area does not fit the wine
+ * desktop (a 1920x1080 window on a 1280x720 desktop) was cropped: only its
+ * top-left showed, under a title bar, which looked like a frozen,
+ * non-fullscreen game. Its Metal layer is instead aspect-fitted to the whole
+ * desktop, and taps and the arrow are mapped through the same rectangle so
+ * the program still gets its own client coordinates. Main thread only.
+ * MADEIRA_DESKTOP_FIT=0 crops. */
+static int winios_desktop_fit_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("MADEIRA_DESKTOP_FIT"); enabled = !(e && e[0] == '0'); }
+    return enabled;
+}
+static BOOL winios_desktop_fit(NSNumber *key, CAMetalLayer *ml, CGRect c) {
+    int desk_w = 0, desk_h = 0;
+    winios_screen_size(&desk_w, &desk_h);
+    CGRect desk = CGRectMake(0, 0, desk_w, desk_h);
+    BOOL outside = desk_w > 0 && desk_h > 0 && c.size.width >= 64 && c.size.height >= 64
+        && !CGRectContainsRect(CGRectInset(desk, -8, -8), c);
+    if (!winios_desktop_fit_enabled() || !outside || !ml.superlayer || !g_compositor_view) {
+        if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
+        return NO;
+    }
+    CGFloat k = MIN(desk_w / c.size.width, desk_h / c.size.height) * g_px_to_pt;
+    CGSize sz = CGSizeMake(c.size.width * k, c.size.height * k);
+    CGRect view = CGRectMake(g_desk_origin.x + (desk_w * g_px_to_pt - sz.width) / 2,
+                             g_desk_origin.y + (desk_h * g_px_to_pt - sz.height) / 2, sz.width, sz.height);
+    ml.frame = [ml.superlayer convertRect:view fromLayer:g_compositor_view.layer];
+    BOOL changed = !g_fit_key || ![g_fit_key isEqual:key] || !CGRectEqualToRect(g_fit_client_px, c);
+    g_fit_key = key; g_fit_client_px = c; g_fit_view_pt = view;
+    static unsigned logged;
+    if (changed && logged < 16) {
+        logged++;
+        fprintf(stderr, "[desktop-fit] hwnd=0x%llx client-px={%.0f,%.0f %.0fx%.0f} desk=%dx%d -> view=(%.1f,%.1f %.1fx%.1f)\n",
+                key.unsignedLongLongValue, c.origin.x, c.origin.y, c.size.width, c.size.height, desk_w, desk_h,
+                view.origin.x, view.origin.y, view.size.width, view.size.height);
+    }
+    return YES;
+}
+/* Desktop px -> compositor-view points through the fitted window, if any. */
+static BOOL winios_desktop_fit_map(CGFloat x, CGFloat y, CGPoint *pt, CGFloat *scale) {
+    if (!g_fit_key || g_fit_client_px.size.width <= 0 || !CGRectContainsPoint(g_fit_client_px, CGPointMake(x, y)))
+        return NO;
+    CGFloat k = g_fit_view_pt.size.width / g_fit_client_px.size.width;
+    if (pt) *pt = CGPointMake(g_fit_view_pt.origin.x + (x - g_fit_client_px.origin.x) * k,
+                              g_fit_view_pt.origin.y + (y - g_fit_client_px.origin.y) * k);
+    if (scale) *scale = k;
+    return YES;
+}
+
 /* main thread only — frame the metal sublayer to the client rect in the
  * parent (window) layer's coordinate space. Parent bounds are the window
  * rect in points, so client offset = (client_px - window_px) * scale. */
@@ -807,8 +1136,9 @@ static void winios_place_metal_layer(NSNumber *key) {
     CGRect w = wv.CGRectValue, c = cv.CGRectValue;
     CGFloat s = g_px_to_pt;
     ml.frame = CGRectMake((c.origin.x - w.origin.x) * s,
-                          (c.origin.y - w.origin.y) * s,
-                          c.size.width * s, c.size.height * s);
+                          (c.origin.y - w.origin.y) * WINIOS_PX_TO_PT_Y,
+                          c.size.width * s, c.size.height * WINIOS_PX_TO_PT_Y);
+    winios_desktop_fit(key, ml, c);
 }
 
 /* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain
@@ -838,6 +1168,7 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
                     hwnd, ml.frame.origin.x, ml.frame.origin.y,
                     ml.frame.size.width, ml.frame.size.height);
             fflush(stderr);
+            winios_census_note_metal((HWND)hwnd);
         }
         result = ml;
     };
@@ -850,6 +1181,9 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
  * x/y/w/h = visible rect, cx/cy/cw/ch = client rect, desktop pixels. */
 void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
                          int cx, int cy, int cw, int ch) {
+    /* Here, not in the block below: the census asks win32u about the window,
+     * which needs this Wine thread. No-op unless the app turned it on. */
+    winios_census_note_frame(hwnd, x, y, w, h, visible);
     dispatch_async(dispatch_get_main_queue(), ^{
         winios_ensure_compositor();
         if (!g_compositor_view) return;
@@ -1035,6 +1369,7 @@ void winios_dump_srcbits(const void *bits, int w, int h, int stride) {
 int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
                            int sw, int sh, int stride, const void *bits) {
     if (sw <= 0 || sh <= 0 || !bits) return 1;   /* nothing to paint */
+    winios_census_note_present(hwnd);   /* no-op unless the census is on */
     size_t snap_len = (size_t)stride * (size_t)sh;
     void *snap = malloc(snap_len);
     if (!snap) {
@@ -1336,13 +1671,23 @@ static void winios_ensure_cursor_layer(void) {
 static void winios_cursor_place(void) {
     if (!g_cursor_layer) return;
     CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
+    CGPoint fitted; CGFloat k = 0;
+    if (winios_desktop_fit_map(x, y, &fitted, &k)) {   /* over a fitted window */
+        if (g_cur_w > 0) {
+            g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * k, g_cur_h * k);
+            g_cursor_layer.position = CGPointMake(fitted.x - g_cur_hx * k, fitted.y - g_cur_hy * k);
+        } else {
+            g_cursor_layer.position = fitted;
+        }
+        return;
+    }
     if (g_cur_w > 0) {
         g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * g_px_to_pt, g_cur_h * g_px_to_pt);
         g_cursor_layer.position = CGPointMake(g_desk_origin.x + (x - g_cur_hx) * g_px_to_pt,
-                                              g_desk_origin.y + (y - g_cur_hy) * g_px_to_pt);
+                                              g_desk_origin.y + (y - g_cur_hy) * WINIOS_PX_TO_PT_Y);
     } else {
         g_cursor_layer.position = CGPointMake(g_desk_origin.x + x * g_px_to_pt,
-                                              g_desk_origin.y + y * g_px_to_pt);
+                                              g_desk_origin.y + y * WINIOS_PX_TO_PT_Y);
     }
 }
 

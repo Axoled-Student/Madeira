@@ -6,7 +6,8 @@ exit report.
    (app/Madeira/Library.swift) and the display layout (app/Madeira/
    GuestDisplay.swift) with small stubs and checks the launch environment a
    profile exports (executable, arguments, virtual monitor size for every
-   entry, x87 precision only when chosen, nothing else for the engine), the
+   entry, x87 precision only when chosen, fastsync's switches only when
+   Settings chose Fastsync, nothing else for the engine), the
    30 FPS fallback without DXMT's 30 FPS cap, profile validation, decoding of
    library files that carry unknown or fork-written keys (display mode,
    control opacity and size), the layout and touch-mapping math of every
@@ -78,7 +79,13 @@ final class PassthroughSubject<Output, Failure: Error> {
     func sink(receiveValue: @escaping (Output) -> Void) -> AnyCancellable { receivers.append(receiveValue); return AnyCancellable() }
 }
 #endif
-enum MadeiraConfig { static func flag(_ name: String, fallback: Bool = true) -> Bool { fallback } }
+enum MadeiraConfig {
+    static var values: [String: String] = [:]   // stands in for madeira.cfg
+    static func flag(_ name: String, fallback: Bool = true) -> Bool { fallback }
+    static func get(_ key: String) -> String? { values[key] }
+    static func bool(_ key: String, default dflt: Bool = false) -> Bool { values[key].map { ["1", "on", "true", "yes"].contains($0) } ?? dflt }
+    @discardableResult static func set(_ key: String, _ value: String?) -> Bool { values[key] = value; return true }
+}
 final class LogStore { static let shared = LogStore(); var lines: [String] = []; func log(_ s: String) { lines.append(s) } }
 var published: (Int32, Int32) = (0, 0)
 func winios_display_mode_changed(_ w: Int32, _ h: Int32) { published = (w, h) }
@@ -90,6 +97,7 @@ enum LibraryError: LocalizedError { case message(String) }
 func env(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
 '''
 swift += block(lib, 'struct LibraryEntry: Codable, Identifiable') + '\n'
+swift += block(lib, 'enum SyncEngine: String, CaseIterable, Identifiable') + '\n'
 swift += '\n'.join(l for l in display.splitlines() if not l.startswith('import ')) + '\n'
 swift += block(lib, 'final class LibraryController: ObservableObject, @unchecked Sendable') + '\n'
 swift += r'''
@@ -122,14 +130,59 @@ expect(env("MADEIRA_SCREEN_W") == "1560" && env("MADEIRA_SCREEN_H") == "720" && 
 expect((try? game.validate()) != nil, "a screen-shape resolution validates")
 game.resolution = "1280x720"; game.configureLaunch()
 
+// A Steam game: Madeira Dock sets what starts, so its profile leaves MADEIRA_EXE alone...
+var steamGame = LibraryEntry(title: "Steam game", relativePath: "Program Files (x86)/Steam/steamapps/common/Some Game", bits: 0)
+steamGame.steamAppID = 4242
+setenv("MADEIRA_EXE", "set-by-dock", 1); setenv("MADEIRA_STEAM_APPID", "1", 1)
+steamGame.configureLaunch()
+expect(env("MADEIRA_EXE") == "set-by-dock" && env("MADEIRA_STEAM_APPID") == nil, "Madeira Dock (the default): the profile sets nothing that starts")
+// ...and "Start with: The game" starts the game's own program, with the game's own Steam identity.
+steamGame.steamStart = "game"; steamGame.steamProgram = "bin/game.exe"; steamGame.steamProgramArguments = "-dx11 \"-name=a b\""
+steamGame.steamProgramFolder = "data"
+expect((try? steamGame.validate()) != nil, "a direct Steam start validates")
+steamGame.configureLaunch()
+let steamFolder = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Some Game"
+expect(env("MADEIRA_EXE") == steamFolder + "\\bin\\game.exe", "The game: its program")
+expect(env("MADEIRA_ARGS") == "-dx11 \"-name=a b\"", "The game: Steam's arguments verbatim")
+expect(env("MADEIRA_STEAM_APPID") == "4242" && env("MADEIRA_STEAM_APPPATH") == steamFolder,
+       "The game: its own App ID and install folder for the bridge")
+expect(env("MADEIRA_WORKDIR") == steamFolder + "\\data", "The game: Steam's working folder")
+steamGame.steamProgramFolder = ""; steamGame.configureLaunch()
+expect(env("MADEIRA_WORKDIR") == steamFolder, "working folder \"\": the install folder")
+steamGame.steamProgramFolder = nil; steamGame.configureLaunch()
+expect(env("MADEIRA_WORKDIR") == nil, "no working folder: the program's own (the bridge's default)")
+expect(steamGame.windowsPath == steamFolder &&
+       steamGame.launchRelativePath == "Program Files (x86)/Steam/steamapps/common/Some Game/bin/game.exe",
+       "the entry keeps its install folder; only the launch path names the program")
+steamGame.steamProgram = nil; steamGame.configureLaunch()
+expect(env("MADEIRA_EXE") == steamFolder, "no program: the folder (ContentView refuses it first)")
+game.configureLaunch()
+expect(env("MADEIRA_STEAM_APPID") == nil && env("MADEIRA_STEAM_APPPATH") == nil && env("MADEIRA_WORKDIR") == nil,
+       "any other launch clears the direct start's identity and folder")
+
 // Engine switches: only x87 precision, and only when chosen (FEX's default otherwise).
 expect(!game.reducedX87, "reduced-precision x87 is off for new entries")
 setenv("FEX_X87REDUCEDPRECISION", "1", 1)
 game.applyEnvironment()
 expect(env("FEX_X87REDUCEDPRECISION") == nil, "x87: nothing exported unless chosen")
-expect(env("MADEIRA_CPU_COUNT") == nil && env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil
-       && env("DXMT_D9_ANISO_LIMIT") == nil, "no other engine switches are exported")
+expect(env("MADEIRA_CPU_COUNT") == nil && env("DXMT_D9_ANISO_LIMIT") == nil, "no other engine switches are exported")
+expect(env("MADEIRA_FASTSYNC") == "auto" && env("MADEIRA_FASTSYNC_SEM") == "0",
+       "no sync keys (Fastsync, the default): the game's fastsync switches are exported")
 expect(LogStore.shared.lines.last == "[display-shape] resolution=1280x720 mode=fit", "the profile's display shape is logged")
+// Fastsync's per-game switches: exported only when Settings chose Fastsync.
+MadeiraConfig.values = ["inproc-sync": "0"]
+unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM"); game.applyEnvironment()
+expect(env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil, "Wine standard sync: no fastsync switches")
+MadeiraConfig.values = ["inproc-sync": "0", "env.MADEIRA_FASTSYNC": "auto"]
+game.applyEnvironment()
+expect(env("MADEIRA_FASTSYNC") == "auto" && env("MADEIRA_FASTSYNC_SEM") == "0",
+       "Fastsync: fast synchronization on by default (the chosen mode), semaphore waits off")
+game.fastSync = false; game.semaphoreFastPath = true; game.applyEnvironment()
+expect(env("MADEIRA_FASTSYNC") == "0" && env("MADEIRA_FASTSYNC_SEM") == "1", "Fastsync: the game's own switches are exported")
+MadeiraConfig.values = ["inproc-sync": "1", "env.MADEIRA_FASTSYNC": "auto"]
+unsetenv("MADEIRA_FASTSYNC"); unsetenv("MADEIRA_FASTSYNC_SEM"); game.applyEnvironment()
+expect(env("MADEIRA_FASTSYNC") == nil && env("MADEIRA_FASTSYNC_SEM") == nil, "Madsync on: the game's fastsync switches are not exported")
+MadeiraConfig.values = [:]; game.fastSync = nil; game.semaphoreFastPath = nil
 game.reducedX87 = true; game.applyEnvironment()
 expect(env("FEX_X87REDUCEDPRECISION") == "1", "reduced x87 exported when chosen")
 game.reducedX87 = false
@@ -193,8 +246,6 @@ let drawn = CGSize(width: 1024, height: 768)
 let aspect = GameSurfaceLayout.rect(guest: guest, aspect: drawn, bounds: view, mode: .aspect)
 expect(near(aspect.width / aspect.height * 3, 4) && near(aspect.height, 390), "Aspect follows the drawn shape")
 expect(GameSurfaceLayout.rect(guest: guest, bounds: view, mode: .aspect) == fit, "Aspect is Fit until a frame is drawn")
-let tall = GameSurfaceLayout.rect(guest: guest, aspect: CGSize(width: 2560, height: 720), bounds: view, mode: .fitHeight)
-expect(near(tall.height, 390) && tall.width > view.width, "Fill height keeps the full height")
 let centre = GameSurfaceLayout.map(point: CGPoint(x: 422, y: 195), guest: guest, bounds: view, mode: .fit)
 expect(near(centre.x, 640) && near(centre.y, 360), "the centre maps to the guest's centre")
 let bar = GameSurfaceLayout.map(point: CGPoint(x: 10, y: 10), guest: guest, bounds: view, mode: .fit)
@@ -205,7 +256,7 @@ let phone = GuestDisplay.defaultMode(forLandscapeView: CGSize(width: 844, height
 let tablet = GuestDisplay.defaultMode(forLandscapeView: CGSize(width: 1024, height: 768))
 expect(phone.w == 1280 && phone.h == 720, "phone default mode is 1280x720")
 expect(tablet.w == 1152 && tablet.h == 864, "4:3 default mode is 1152x864 (cheapest 4:3 of at least 0.9 MP)")
-expect(DisplayMode.allCases.map { $0.label } == ["Fit", "Fill", "Stretch", "Aspect", "Fill height"], "the five Aspect & scaling choices")
+expect(DisplayMode.allCases.map { $0.label } == ["Fit", "Fill", "Stretch", "Aspect"], "the four Aspect & scaling choices")
 
 // Controller navigation.
 let c = LibraryController.shared

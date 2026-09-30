@@ -538,8 +538,8 @@ static void madeira_link_syswow64_wbem(NSFileManager *fm, NSString *prefix, NSSt
             linked, sizeof(wbem) / sizeof(wbem[0]));
 }
 
-/* C:\windows\winsxs for 32-bit targets: the x86 side-by-side assemblies Wine
- * ships.
+/* C:\windows\winsxs for 32-bit processes: the x86 side-by-side assemblies Wine
+ * ships. Re-seeded every session, because the links name the bundle path.
  *
  * The prefix has no winsxs directory: the template does not carry one and
  * this port never runs wineboot's fake-DLL install, which is what builds it on
@@ -907,10 +907,44 @@ static void *wine_process_thread(void *arg) {
          * steam_appid.txt, set SteamAppPath to that game's directory, and give each child
          * its own environment rather than mutating one process-global set shared by every
          * pseudo-process. This path usually launches explorer.exe and cannot know which
-         * title the desktop will start later, so a conditional here cannot work. */
-        setenv("SteamAppPath", "C:\\Program Files\\Thumper", 1);
-        setenv("SteamGameId", "356400", 1);
-        setenv("SteamAppId",  "356400", 1);
+         * title the desktop will start later, so a conditional here cannot work.
+         *
+         * A Madeira Dock session is the one launch that can know: it runs Valve's
+         * client inside the host process, and the client gives every game it
+         * starts that game's own identity. The fixed identity above reached the
+         * client and the game (both inherit this environment), so a Dock launch
+         * publishes none of the three. ContentView sets MADEIRA_DOCK_SESSION=1 for
+         * a Dock launch only and clears it for every other launch, which keeps
+         * the fixed identity exactly as before.
+         *
+         * A Steam game the library starts as its own program ("Start with: The
+         * game", LibraryEntry.configureLaunch) knows its title too. It passes that
+         * game's App ID and install folder in MADEIRA_STEAM_APPID / MADEIRA_STEAM_APPPATH,
+         * and this launch publishes the game's own identity instead of the fixed one. Both
+         * are cleared here, so no later launch inherits them. */
+        const char *dock_session = getenv("MADEIRA_DOCK_SESSION");
+        const char *direct_app = getenv("MADEIRA_STEAM_APPID");    /* set by the library for one direct Steam start (Start with: The game); not a setting */
+        const char *direct_path = getenv("MADEIRA_STEAM_APPPATH"); /* that game's install folder, with MADEIRA_STEAM_APPID; not a setting */
+        if (dock_session && dock_session[0] == '1') {
+            unsetenv("SteamAppPath");
+            unsetenv("SteamGameId");
+            unsetenv("SteamAppId");
+            dprintf(STDERR_FILENO, "[steam-env] Madeira Dock session: no fixed Steam game identity published\n");
+        } else if (direct_app && direct_app[0] && strlen(direct_app) <= 10 &&
+            strspn(direct_app, "0123456789") == strlen(direct_app) &&
+            direct_path && (direct_path[0] == 'C' || direct_path[0] == 'c') && direct_path[1] == ':' &&
+            direct_path[2] == '\\' && strlen(direct_path) < 1024 && !strstr(direct_path, "..")) {
+            setenv("SteamAppPath", direct_path, 1);
+            setenv("SteamGameId", direct_app, 1);
+            setenv("SteamAppId",  direct_app, 1);
+            dprintf(STDERR_FILENO, "[steam-start] direct start: the game's own Steam identity (app %s) published\n", direct_app);
+        } else {
+            setenv("SteamAppPath", "C:\\Program Files\\Thumper", 1);
+            setenv("SteamGameId", "356400", 1);
+            setenv("SteamAppId",  "356400", 1);
+        }
+        unsetenv("MADEIRA_STEAM_APPID");
+        unsetenv("MADEIRA_STEAM_APPPATH");
 
         /* iOS-Madeira 2026-07-02: publish the TRUE JIT-pool RX->RW offset to
          * xtajit64.dll (its own FEXCore copy reads this via getenv in
@@ -1025,6 +1059,14 @@ static void *wine_process_thread(void *arg) {
                     setenv(k.UTF8String, v.UTF8String, 1);
                     LOG("madeira.cfg env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
                     fprintf(stderr, "[madeira-env] ml1062 %s=%s\n", k.UTF8String, v.UTF8String);
+                }
+                /* Fastsync is the default sync engine: with neither inproc-sync nor
+                 * env.MADEIRA_FASTSYNC in madeira.cfg, Wine gets MADEIRA_FASTSYNC=auto,
+                 * the value Settings > Sync engine > Fastsync writes. Never overrides a
+                 * value already set (a game's own fastsync switch sets 0). */
+                if (madeira_cfg_sync_engine() == MADEIRA_SYNC_FASTSYNC && !getenv("MADEIRA_FASTSYNC")) {
+                    setenv("MADEIRA_FASTSYNC", "auto", 0);
+                    fprintf(stderr, "[madeira-env] sync engine: fastsync (default), MADEIRA_FASTSYNC=auto\n");
                 }
             }
         }
@@ -1175,15 +1217,19 @@ static void *wine_process_thread(void *arg) {
                 }
             }
 
-            /* WoW64: the i386 farm for every session once the bundle has it;
-             * the x86 side-by-side store and syswow64\wbem for a 32-bit
-             * target (docs/WOW64.md). */
+            /* WoW64: the i386 farm, syswow64\wbem and the x86 side-by-side
+             * store for every session once the bundle has it (docs/WOW64.md).
+             * The store was seeded for a 32-bit target only, but a 64-bit
+             * target (a launcher, the Dock host) starts 32-bit children too,
+             * and their activation contexts redirect comctl32 and the VC80/
+             * VC90 CRT into the store. Its links name the bundle path, which
+             * changes on every reinstall: a session with a 64-bit target after
+             * a reinstall left them dangling, and such a child died in the
+             * loader with c0000135 for DLLs syswow64 still had. */
             if (has_i386_set) {
                 madeira_link_syswow64(fm, prefix, bundlePath);
-                if (is_i386_target) {
-                    madeira_link_syswow64_wbem(fm, prefix, bundlePath);
-                    madeira_seed_winsxs_x86(fm, prefix, bundlePath);
-                }
+                madeira_link_syswow64_wbem(fm, prefix, bundlePath);
+                madeira_seed_winsxs_x86(fm, prefix, bundlePath);
             }
 
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
@@ -1350,8 +1396,31 @@ static void *wine_process_thread(void *arg) {
          * Wine path — and Thumper's relative cache opens (e.g.,
          * "cache/721e72f7.pc") then resolve to doubled paths that don't
          * exist. Per GPT diagnosis 2026-05-12. Only chdir for full-path EXE
-         * launches; bare-name launches (cube, hello-x64) use C:\windows\system32. */
-        if (strchr(madeira_exe, '\\') || (madeira_exe[0] && madeira_exe[1] == ':')) {
+         * launches; bare-name launches (cube, hello-x64) use C:\windows\system32.
+         *
+         * A Steam game started as its own program ("Start with: The game") may carry
+         * the working folder Steam's launch configuration names, in MADEIRA_WORKDIR
+         * (a C:\ folder of the prefix, for this launch only; cleared here). That folder
+         * is used instead of the exe's own. */
+        const char *launch_workdir = getenv("MADEIRA_WORKDIR");   /* set by the library for one launch: Steam's working folder; not a setting */
+        char workdir[512] = "";
+        if (launch_workdir && (launch_workdir[0] == 'C' || launch_workdir[0] == 'c') && launch_workdir[1] == ':' &&
+            launch_workdir[2] == '\\' && launch_workdir[3] && !strstr(launch_workdir, "..") &&
+            strlen(launch_workdir) < sizeof(workdir) - 2)
+            snprintf(workdir, sizeof(workdir), "%s", launch_workdir);
+        unsetenv("MADEIRA_WORKDIR");
+        if (workdir[0]) {
+            char unix_dir[1024], windir[512], wine_cwd[520];
+            snprintf(windir, sizeof(windir), "%s", workdir + 3);
+            for (char *p = windir; *p; p++) if (*p == '\\') *p = '/';
+            snprintf(unix_dir, sizeof(unix_dir), "%s/drive_c/%s", g_prefix_path, windir);
+            int rc = chdir(unix_dir);
+            setenv("PWD", unix_dir, 1);
+            snprintf(wine_cwd, sizeof(wine_cwd), "%s\\", workdir);
+            setenv("MADEIRA_INITIAL_CWD", wine_cwd, 1);
+            dprintf(STDERR_FILENO, "[WineProc] working folder from the launch: chdir(%s) = %d errno=%d, MADEIRA_INITIAL_CWD=%s\n",
+                    unix_dir, rc, rc ? errno : 0, wine_cwd);
+        } else if (strchr(madeira_exe, '\\') || (madeira_exe[0] && madeira_exe[1] == ':')) {
             /* Convert "C:\Program Files\Thumper\X.exe" → unix path */
             char unix_dir[1024];
             const char *drive_c = "drive_c";

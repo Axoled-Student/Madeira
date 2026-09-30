@@ -181,6 +181,9 @@ final class MetalBackedView: UIView {
         guard let w = window else { return }
         let r = gameRect()
         MetalHostView.shared.frame = convert(r, to: w)
+        // The desktop compositor lays the guest display out in the same rect,
+        // so Aspect / Fill / Stretch / Fit apply to desktop sessions as well.
+        winios_set_desktop_rect(r.minX - bounds.minX, r.minY - bounds.minY, r.width, r.height, 1)
         let guest = guestSize(), mode = effectiveDisplayMode()
         let line = String(format: "mode=%@ guest=%.0fx%.0f bounds=%.0fx%.0f -> rect=(%.0f,%.0f %.0fx%.0f)",
                           mode.rawValue, guest.width, guest.height, bounds.width, bounds.height,
@@ -617,8 +620,11 @@ final class MetalBackedView: UIView {
         }
 
         let sens = CGFloat(InputSettings.shared.sensAbs)   // desktop px per view pt
-        let maxX = CGFloat(envInt("MADEIRA_SCREEN_W", 1024) - 1)
-        let maxY = CGFloat(envInt("MADEIRA_SCREEN_H", 768) - 1)
+        // The live desktop size: a program's display-mode change resizes it.
+        var deskW: Int32 = 0, deskH: Int32 = 0
+        winios_screen_size(&deskW, &deskH)
+        let maxX = CGFloat(max(Int(deskW), 1) - 1)
+        let maxY = CGFloat(max(Int(deskH), 1) - 1)
         Self.cursor.x = min(max(Self.cursor.x + dx * sens, 0), maxX)
         Self.cursor.y = min(max(Self.cursor.y + dy * sens, 0), maxY)
         postPointer(F_MOVE | F_ABS)
@@ -833,6 +839,10 @@ struct JoystickFace: View {
     /// size shows the glyph alone, where a knob plus a symbol would be a smudge.
     /// nil (the portrait pad) draws the face exactly as before.
     var glyph: String?
+    /// false: the caller puts the glass behind this face itself. The overlay
+    /// stick draws the face at pad size and scales it to the control; glass
+    /// under that scaleEffect is drawn off-centre from the ring and knob.
+    var glass = true
     private var expanded: Bool { held || alwaysExpanded }
 
     static let idleDiameter: CGFloat = 22
@@ -840,14 +850,6 @@ struct JoystickFace: View {
     private var idleDiameter: CGFloat { Self.idleDiameter }
     private var padRadius: CGFloat { Self.padRadius }
     private let knobTravelRatio: CGFloat = 0.30
-
-    @ViewBuilder private var interior: some View {
-        if #available(iOS 26.0, *) {
-            Circle().fill(.clear).glassEffect(.regular, in: Circle())
-        } else {
-            Circle().fill(.ultraThinMaterial)
-        }
-    }
 
     private func knobOffset(_ d: CGFloat) -> CGSize {
         guard dir >= 0, expanded else { return .zero }
@@ -858,8 +860,7 @@ struct JoystickFace: View {
 
     var body: some View {
         let d = expanded ? padRadius * 2 : idleDiameter
-        return ZStack {
-            interior
+        let face = ZStack {
             Circle().strokeBorder(Color.white.opacity(0.55), lineWidth: expanded ? 2 : 1.5)
             if let g = glyph, !expanded {
                 Image(systemName: g)
@@ -896,6 +897,14 @@ struct JoystickFace: View {
                 .opacity(glyph == nil || expanded ? 1 : 0)
         }
         .frame(width: d, height: d)
+        // The ring, glyph and knob are the glass's content, not siblings of it:
+        // an overlay stick sits in the controls' GlassEffectContainer, which
+        // composites every glass over its siblings and blurred the knob.
+        if glass {
+            face.glassFace(GlassShape(circle: true))
+        } else {
+            face
+        }
     }
 }
 
@@ -1676,6 +1685,7 @@ struct ContentView: View {
                     setenv("MADEIRA_DESKTOP", "1", 1)
                     setenv("MADEIRA_SCREEN_W", String(deskW), 1)
                     setenv("MADEIRA_SCREEN_H", String(deskH), 1)
+                    winios_display_mode_changed(Int32(deskW), Int32(deskH))
                     // ml371: surfdump ground truth — the "frozen desktop"
                     // question (fresh pixels never presented vs nothing
                     // painting upstream) is undecidable from the log alone
@@ -1837,6 +1847,7 @@ struct ContentView: View {
                     setenv("MADEIRA_DESKTOP", "1", 1)
                     setenv("MADEIRA_SCREEN_W", String(deskW), 1)
                     setenv("MADEIRA_SCREEN_H", String(deskH), 1)
+                    winios_display_mode_changed(Int32(deskW), Int32(deskH))
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
@@ -2232,6 +2243,24 @@ struct ContentView: View {
     /// applies the entry's launch profile and runs the same full sequence as the
     /// developer interface's buttons.
     private func launchLibraryEntry(_ entry: LibraryEntry) {
+        // A Steam game starts through Madeira Dock with its own launch profile (SteamGames.swift),
+        // unless its Game details page chose "The game": then its own program starts below, like
+        // any library game (SteamDirectStart).
+        if let appID = entry.steamAppID, !entry.startsSteamGameDirectly {
+            guard let game = MadeiraDock.games(drive: MadeiraDock.drive).first(where: { $0.id == appID }) else {
+                library.error = "Steam no longer lists this game as installed. Refresh the library and try again."; return
+            }
+            LogStore.shared.log("[steam-games] play app=\(appID)")
+            startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)
+            return
+        }
+        if let appID = entry.steamAppID {
+            guard entry.steamProgram?.isEmpty == false else {
+                library.error = "Choose the program to start in Game details › Steam › Program."; return
+            }
+            LogStore.shared.log("[steam-start] app=\(appID) direct source=\(entry.steamProgramSource ?? "-") " +
+                                "args=\(entry.launchArguments.isEmpty ? 0 : 1) folder=\(entry.steamWorkingWindowsPath == nil ? "program" : "steam")")
+        }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, library.current == nil else {
             library.error = "A session is already running."; return
         }
@@ -2245,13 +2274,13 @@ struct ContentView: View {
         guard jit_check_debugged() else {
             library.error = "Enable JIT before playing."; return
         }
-        do { if entry.desktop != true { _ = try LibraryModel.executable(entry.relativePath) }; try entry.validate() }
+        do { if entry.desktop != true { _ = try LibraryModel.executable(entry.launchRelativePath) }; try entry.validate() }
         catch {
             library.error = error.localizedDescription
             logStore.log("[launch-preflight] profile validation failed: \(error.localizedDescription)", level: .error)
             return
         }
-        guard entry.windowsPath.utf8.count < 1024, entry.arguments.utf8.count < 1024 else {
+        guard entry.launchWindowsPath.utf8.count < 1024, entry.launchArguments.utf8.count < 1024 else {
             library.error = "The executable path or launch arguments are too long."; return
         }
         entry.configureLaunch()
@@ -2269,6 +2298,9 @@ struct ContentView: View {
             if profile != nil { LibraryModel.shared.launchFailed() }
             return
         }
+        // Steam downloads wait for the session, and the app's own Steam connection closes
+        // before Valve's client signs in with the same account (SteamOwnedLibrary).
+        SteamOwnedLibrary.shared.sessionChanged(active: true)
         /* ml1095: one config file. Written once from any legacy madeira-*.txt. */
         MadeiraConfig.migrateLegacy { self.logStore.log($0) }
         MadeiraConfig.deleteLegacyFiles { self.logStore.log($0) }   /* ml1096: the old files go once the cfg exists */
@@ -2398,8 +2430,18 @@ struct ContentView: View {
             // Madeira Dock: a Dock launch may opt in to a compact pool (only that
             // launch; off by default). madeira.cfg pool below still wins.
             let dockLaunch = MadeiraDock.takeLaunchRequest()
+            // A Dock session publishes no fixed Steam game identity to its guests
+            // (WineProcessBridge.m): Valve's client runs in the host and gives each
+            // game its own. Every other launch clears the flag and is unchanged.
+            // env.MADEIRA_DOCK_CLEAR_STEAM_ID = 0 keeps the fixed identity (A/B).
+            if dockLaunch.dock && SteamSignIn.flag("MADEIRA_DOCK_CLEAR_STEAM_ID", default: true) {
+                setenv("MADEIRA_DOCK_SESSION", "1", 1)
+            } else {
+                unsetenv("MADEIRA_DOCK_SESSION")
+            }
             var poolSizeMB = DockPerformancePolicy.sessionPoolMB(standard: 896, dock: dockLaunch.dock, compact: dockLaunch.compact)
             if poolSizeMB != 896 { logStore.log("[dock-pool] compact JIT pool \(poolSizeMB)MB for this Dock launch") }
+            // madeira.cfg pool: the JIT pool size in MB (256 to 1152) for every launch; wins over the size above.
             if let txt = MadeiraConfig.get("pool"),
                let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
                mb >= 256, mb <= 1152 {
@@ -2872,7 +2914,9 @@ struct ContentView: View {
     /// From the library (Settings › Steam › Madeira Dock) the start is a library
     /// session: the library's one-session-per-run rule applies first, failures
     /// show in the library, and the session gets the full-screen game view.
-    private func startDock(_ game: DockGame, compactPool: Bool) {
+    /// `profile` is a Steam game's library entry (its Game details page): the
+    /// session then takes that entry's display, performance and on-screen settings.
+    private func startDock(_ game: DockGame, compactPool: Bool, profile: LibraryEntry? = nil) {
         let inLibrary = library.enabled
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
@@ -2889,46 +2933,84 @@ struct ContentView: View {
             library.restartNotice = LibraryModel.restartMessage
             return
         }
-        do {
-            try MadeiraDock.validate(game, drive: MadeiraDock.drive)
-            guard let signIn = SteamSignIn.credentialsForDock() else {
-                throw DockError.message("Sign in to Steam in Madeira before starting Dock.")
-            }
-            try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: game.id)
-        } catch {
+        func fail(_ error: Error) {
             MadeiraDock.cleanup()
+            SteamOwnedLibrary.shared.dockEnded()
             MadeiraDockModel.shared.status = error.localizedDescription
             logStore.log("[madeira-dock] not started: \(error.localizedDescription)", level: .error)
             if inLibrary { library.error = error.localizedDescription }
-            return
         }
-        MadeiraDock.configure(game)
-        // The game's one-time installs (its Steam install script) run first, in the same
-        // session. No session runs yet, so the registry files can be read and written.
-        DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)
-        // Only a start that runs installers turns madsync off, for its own session
-        // (build/madsync/madsync.c reads MADEIRA_MADSYNC_SESSION once, when the server starts).
-        if DockInstallers.serverSync {
-            setenv("MADEIRA_MADSYNC_SESSION", "0", 1)
-            logStore.log("[dock-installers] this session runs one-time installs: madsync off for this session only (MADEIRA_MADSYNC_SESSION=0)")
-        } else {
-            unsetenv("MADEIRA_MADSYNC_SESSION")
+        do {
+            try MadeiraDock.validate(game, drive: MadeiraDock.drive)
+            try profile?.validate()
+            guard SteamSignIn.isSignedIn else { throw DockError.message("Sign in to Steam in Madeira before starting Dock.") }
+        } catch { fail(error); return }
+        // Only one sign-in of the account may be online: the app's own Steam connection
+        // (library, playtime, downloads) logs off and its socket closes before the sign-in
+        // is handed to Valve's client, and it stays off until the Dock session has ended
+        // (SteamOwnedLibrary.prepareDock / dockEnded, SteamConnectionGate).
+        Task { @MainActor in
+            await SteamOwnedLibrary.shared.prepareDock()
+            do {
+                // The launch state may have changed while the connection closed.
+                guard jit_check_debugged(), wine_process_is_running() == 0, wineserver_is_running() == 0,
+                      !inLibrary || library.current == nil else {
+                    throw DockError.message("The launch state changed. Enable JIT and try again.")
+                }
+                guard let signIn = SteamSignIn.credentialsForDock() else {
+                    throw DockError.message("Sign in to Steam in Madeira before starting Dock.")
+                }
+                try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: game.id)
+            } catch { fail(error); return }
+            MadeiraDock.configure(game)
+            // The game's one-time installs (its Steam install script) run first, in the same
+            // session. No session runs yet, so the registry files can be read and written.
+            DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)
+            // Only a start that runs installers turns madsync off, for its own session
+            // (build/madsync/madsync.c reads MADEIRA_MADSYNC_SESSION once, when the server starts).
+            if DockInstallers.serverSync {
+                setenv("MADEIRA_MADSYNC_SESSION", "0", 1)
+                logStore.log("[dock-installers] this session runs one-time installs: madsync off for this session only (MADEIRA_MADSYNC_SESSION=0)")
+            } else {
+                unsetenv("MADEIRA_MADSYNC_SESSION")
+            }
+            // A Dock session starts 64-bit (explorer, then the host), but the programs it starts
+            // later are often 32-bit: one-time installers and the 32-bit games Valve's client
+            // launches. win32u decides once, when the session's first program initialises it,
+            // whether the GDI handle table is a section that every 32-bit program can map inside
+            // its own guest window (wine dlls/win32u/gdiobj.c, gdi_shared_use_section). Left to
+            // that default, a Dock session's table is private host memory, and 32-bit gdi32
+            // truncates its address and faults on its first GDI handle. The regular launch path
+            // is unchanged; env.MADEIRA_GDI_SHARED_SECTION = 0 in madeira.cfg, exported after
+            // this, keeps the default for Dock sessions too.
+            setenv("MADEIRA_GDI_SHARED_SECTION", "1", 1)
+            var width = 1280, height = 720
+            if let txt = MadeiraConfig.get("desktop-size") {
+                let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { width = p[0]; height = p[1] }
+            }
+            // A Steam game's own Resolution (validated above) sizes its Dock desktop.
+            if let size = profile?.resolution.split(separator: "x").compactMap({ Int($0) }), size.count == 2 {
+                width = size[0]; height = size[1]
+            }
+            setenv("MADEIRA_EXE", "explorer.exe", 1)
+            setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
+            setenv("MADEIRA_DESKTOP", "1", 1)
+            setenv("MADEIRA_SCREEN_W", String(width), 1)
+            setenv("MADEIRA_SCREEN_H", String(height), 1)
+            // The compositor and touch mapping read the published size
+            // (winios_screen_size), which a program's display-mode change moves;
+            // start this session from its own desktop size, not a previous one.
+            winios_display_mode_changed(Int32(width), Int32(height))
+            MadeiraDock.requestLaunch(compactPool: compactPool)
+            logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
+            MadeiraDockModel.shared.watchReport()
+            if inLibrary {
+                if let profile { library.begin(profile, dock: game) }
+                else { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false, dock: game) }
+            }
+            runWineFullSequence(profile: profile)
         }
-        var width = 1280, height = 720
-        if let txt = MadeiraConfig.get("desktop-size") {
-            let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-            if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { width = p[0]; height = p[1] }
-        }
-        setenv("MADEIRA_EXE", "explorer.exe", 1)
-        setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
-        setenv("MADEIRA_DESKTOP", "1", 1)
-        setenv("MADEIRA_SCREEN_W", String(width), 1)
-        setenv("MADEIRA_SCREEN_H", String(height), 1)
-        MadeiraDock.requestLaunch(compactPool: compactPool)
-        logStore.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
-        MadeiraDockModel.shared.watchReport()
-        if inLibrary { library.begin(.dockSession(title: game.name, width: width, height: height), remember: false) }
-        runWineFullSequence()
     }
 
     /// ml589: locate an installed Steam inside the prefix and (re)generate
@@ -3194,6 +3276,54 @@ enum ControlAction: Codable, Equatable, Hashable {
     var padName: String? { if case .pad(let name) = self { return name }; return nil }
     var isPadStick: Bool { padName == "LS" || padName == "RS" }
 
+    // ------------------------------------------------------------------
+    // HOW A VIRTUAL CONTROLLER BUTTON IS DRAWN. The shape is part of the
+    // button's identity: a wide rounded rectangle says "shoulder", a capsule
+    // says "system", a coloured circle says "face", so a layout reads without
+    // its labels. Saved layouts keep their names ("Menu", "View", "D↑"); only
+    // the drawing changes.
+    // ------------------------------------------------------------------
+    enum PadFace { case round, wide, capsule, small }
+
+    var padFace: PadFace? {
+        guard let n = padName else { return nil }
+        switch n {
+        case "LB", "RB", "LT", "RT": return .wide
+        case "Menu", "View":         return .capsule
+        case "L3", "R3":             return .small
+        default:                     return .round
+        }
+    }
+    /// SF Symbol drawn instead of a label: the four D-pad directions.
+    var padGlyph: String? {
+        switch padName {
+        case "D↑": return "arrowtriangle.up.fill"
+        case "D↓": return "arrowtriangle.down.fill"
+        case "D←": return "arrowtriangle.left.fill"
+        case "D→": return "arrowtriangle.right.fill"
+        default:   return nil
+        }
+    }
+    /// The text drawn on the control. Menu/View are the XInput names the
+    /// layout stores; the buttons themselves read START/SELECT.
+    var padFaceLabel: String {
+        switch padName {
+        case "Menu": return "START"
+        case "View": return "SELECT"
+        default:     return label
+        }
+    }
+    /// Drawn size, given the layout's diameter for a round button. Shoulders
+    /// are wide, Start/Select are small pills, stick clicks are small circles.
+    func controlSize(diameter d: CGFloat) -> CGSize {
+        switch padFace {
+        case .wide:    return CGSize(width: d * 1.6, height: d * 0.74)
+        case .capsule: return CGSize(width: d * 1.2, height: d * 0.5)
+        case .small:   return CGSize(width: d * 0.8, height: d * 0.8)
+        default:       return CGSize(width: d, height: d)
+        }
+    }
+
     var label: String {
         switch self {
         case .none:            return "—"
@@ -3275,6 +3405,9 @@ final class TouchControlsModel: ObservableObject {
     static func diameter(_ c: TouchControl) -> CGFloat {
         baseDiameter * CGFloat(c.scale) * CGFloat(shared.sizeScale)
     }
+    /// The drawn frame: the diameter for round controls, the pad button's own
+    /// shape otherwise (ControlAction.controlSize).
+    static func size(_ c: TouchControl) -> CGSize { c.action.controlSize(diameter: diameter(c)) }
 
     private var loading = false
     private static var url: URL {
@@ -3428,11 +3561,7 @@ struct TouchControlsOverlay: View {
             ZStack(alignment: .top) {
                 if landscape {
                     if (m.visible || m.editing) && !library.blocksGameplayTouch {
-                        ForEach(m.controls) { c in
-                            TouchControlButton(control: c, screen: geo.size)
-                                // A library session's Control opacity; full while editing.
-                                .opacity(session && !m.editing ? library.opacity : 1)
-                        }
+                        controls(geo.size, session: session)
                     }
                     if session && !m.editing { LibraryHUD() } else { topBar }
                     if m.editing, let i = m.index(of: m.selected) {
@@ -3452,6 +3581,28 @@ struct TouchControlsOverlay: View {
             .onDisappear { GamepadInput.shared.configureTouch(controls: []) }
         }
         .ignoresSafeArea()
+    }
+
+    /// Every control in ONE GlassEffectContainer: on iOS 26 the system merges
+    /// glass shapes that come within `spacing` of each other, so a D-pad cross
+    /// or a face diamond pinched tight reads as one piece of glass and a button
+    /// dragged next to another flows into it. 12 pt: the built-in layout's
+    /// neighbours sit further apart than that, so nothing merges until it is
+    /// moved almost touching. Before 26 the same views stack as plain material.
+    @ViewBuilder private func controls(_ screen: CGSize, session: Bool) -> some View {
+        let buttons = ForEach(m.controls) { c in
+            TouchControlButton(control: c, screen: screen)
+                // A library session's Control opacity; full while editing.
+                .opacity(session && !m.editing ? library.opacity : 1)
+        }
+        if #available(iOS 26.0, *) {
+            GlassEffectContainer(spacing: 12) {
+                ZStack { buttons }
+                    .frame(width: screen.width, height: screen.height, alignment: .topLeading)
+            }
+        } else {
+            buttons
+        }
     }
 
     private func configureGamepad(landscape: Bool) {
@@ -3557,16 +3708,57 @@ struct TouchControlsOverlay: View {
 }
 
 /// Shared glass backing, with the pre-26 fallback the codebase already uses.
+/// A circle, a capsule or a rounded rectangle; `tint` colours the glass itself
+/// (the four face buttons), so the colour is a hue on the material rather than
+/// an opaque disc. Inside a GlassEffectContainer these merge when they come
+/// close, which is what makes a tight D-pad or face diamond read as one piece.
 struct GlassShape: View {
     var circle = false
+    var capsule = false
+    var cornerRadius: CGFloat = 18
+    var tint: Color? = nil
+    fileprivate var shape: AnyShape {
+        if circle { return AnyShape(Circle()) }
+        if capsule { return AnyShape(Capsule()) }
+        return AnyShape(RoundedRectangle(cornerRadius: cornerRadius))
+    }
     var body: some View {
+        Color.clear.glassFace(self)
+    }
+}
+
+extension View {
+    /// Glass BEHIND this view, with the view as the glass's content. Inside a
+    /// GlassEffectContainer every glass effect is composited together as one
+    /// layer over the container's other children, so a label that is merely a
+    /// sibling of its glass ends up blurred underneath it; a label that is the
+    /// glass view's own content is drawn on top, as the system's buttons are.
+    @ViewBuilder func glassFace(_ g: GlassShape) -> some View {
         if #available(iOS 26.0, *) {
-            if circle { Circle().fill(.clear).glassEffect(.regular, in: Circle()) }
-            else { RoundedRectangle(cornerRadius: 18).fill(.clear)
-                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18)) }
+            if let tint = g.tint {
+                self.glassEffect(.regular.tint(tint.opacity(0.55)), in: g.shape)
+            } else {
+                self.glassEffect(.regular, in: g.shape)
+            }
         } else {
-            if circle { Circle().fill(.ultraThinMaterial) }
-            else { RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial) }
+            self.background {
+                g.shape.fill(.ultraThinMaterial)
+                if let tint = g.tint { g.shape.fill(tint.opacity(0.35)) }
+            }
+        }
+    }
+}
+
+extension ControlAction {
+    /// Xbox face colours. Everything else is uncoloured: a wash of tint on every
+    /// button would make the four that mean something unreadable.
+    var padTint: Color? {
+        switch padName {
+        case "A": return Color(red: 0.36, green: 0.76, blue: 0.30)
+        case "B": return Color(red: 0.88, green: 0.28, blue: 0.24)
+        case "X": return Color(red: 0.24, green: 0.53, blue: 0.92)
+        case "Y": return Color(red: 0.96, green: 0.76, blue: 0.16)
+        default:  return nil
         }
     }
 }
@@ -3581,37 +3773,104 @@ struct TouchControlButton: View {
     @State private var padVector = CGSize.zero
 
     private var diameter: CGFloat { TouchControlsModel.diameter(control) }
+    private var size: CGSize { TouchControlsModel.size(control) }
     private var isStick: Bool { control.action.stickKeys != nil || control.action.isPadStick }
     private var isSelected: Bool { m.editing && m.selected == control.id }
+
+    /// The resting outline and the edit-mode selection ring, in the shape the
+    /// control actually has.
+    private var outline: AnyShape {
+        switch control.action.padFace {
+        case .some(.wide):    return AnyShape(RoundedRectangle(cornerRadius: size.height * 0.30))
+        case .some(.capsule): return AnyShape(Capsule())
+        default:              return AnyShape(Circle())
+        }
+    }
+
+    /// A controller button: coloured circle (A/B/X/Y), arrow (D-pad), wide
+    /// shoulder (LB/RB/LT/RT), START/SELECT pill, small L3/R3.
+    @ViewBuilder private var padFace: some View {
+        let a = control.action
+        switch a.padFace ?? .round {
+        case .round:
+            Group {
+                if let g = a.padGlyph {
+                    Image(systemName: g)
+                        .font(.system(size: size.height * 0.40, weight: .semibold))
+                        .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.88))
+                } else {
+                    Text(a.padFaceLabel)
+                        .font(.system(size: size.height * (a.padFaceLabel.count > 2 ? 0.24 : 0.40), weight: .semibold))
+                        .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.92))
+                }
+            }
+            .frame(width: size.width, height: size.height)
+            .glassFace(GlassShape(circle: true, tint: a.padTint))
+        case .small:
+            Text(a.padFaceLabel)
+                .font(.system(size: size.height * 0.36, weight: .semibold))
+                .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+                .frame(width: size.width, height: size.height)
+                .glassFace(GlassShape(circle: true))
+        case .wide:
+            Text(a.padFaceLabel)
+                .font(.system(size: size.height * 0.42, weight: .semibold))
+                .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.88))
+                .frame(width: size.width, height: size.height)
+                .glassFace(GlassShape(cornerRadius: size.height * 0.30))
+        case .capsule:
+            Text(a.padFaceLabel)
+                .font(.system(size: size.height * 0.40, weight: .semibold))
+                .kerning(0.6)
+                .minimumScaleFactor(0.5)
+                .lineLimit(1)
+                .padding(.horizontal, 6)
+                .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+                .frame(width: size.width, height: size.height)
+                .glassFace(GlassShape(capsule: true))
+        }
+    }
 
     var body: some View {
         ZStack {
             if control.action.isPadStick {
-                GlassShape(circle: true)
-                Circle().fill(.white.opacity(isDown ? 0.55 : 0.25))
-                    .frame(width: diameter * 0.42, height: diameter * 0.42)
-                    .offset(x: padVector.width * diameter * 0.29, y: padVector.height * diameter * 0.29)
-                Text(control.action.label).font(.caption).foregroundStyle(.white.opacity(0.8))
+                ZStack {
+                    Circle().fill(.white.opacity(isDown ? 0.55 : 0.25))
+                        .frame(width: diameter * 0.42, height: diameter * 0.42)
+                        .offset(x: padVector.width * diameter * 0.29, y: padVector.height * diameter * 0.29)
+                    Text(control.action.label).font(.caption).foregroundStyle(.white.opacity(0.8))
+                }
+                .frame(width: diameter, height: diameter)
+                .glassFace(GlassShape(circle: true))
             } else if control.action.stickKeys != nil {
                 // Reuse the portrait pad's face so both look and animate the
                 // same; scale it to whatever size this control was pinched to.
+                // The glass goes on at the control's real size, outside the
+                // scaleEffect, so it stays centred on the ring and knob.
                 JoystickFace(held: isDown, dir: stickDir, alwaysExpanded: true,
-                              glyph: control.action.stickGlyph)
+                              glyph: control.action.stickGlyph, glass: false)
                     .frame(width: JoystickFace.padRadius * 2,
                            height: JoystickFace.padRadius * 2)
                     .scaleEffect(diameter / (JoystickFace.padRadius * 2))
+                    .frame(width: diameter, height: diameter)
+                    .glassFace(GlassShape(circle: true))
+            } else if control.action.isPad {
+                padFace
             } else {
-                GlassShape(circle: true)
+                // The label is the glass's content (see glassFace), so it is drawn
+                // on top of the glass rather than blurred underneath it.
                 Text(control.action.label)
                     .font(.system(size: diameter * (control.action.label.count > 2 ? 0.22 : 0.34),
                                   weight: .medium))
                     .foregroundStyle(.white.opacity(isDown ? 1.0 : 0.85))
+                    .frame(width: size.width, height: size.height)
+                    .glassFace(GlassShape(circle: true))
             }
         }
-        .frame(width: diameter, height: diameter)
-        .overlay(Circle().stroke(.white.opacity(isSelected ? 0.95
-                                                : (isStick ? 0 : 0.28)),
-                                 lineWidth: isSelected ? 2 : 1))
+        .frame(width: size.width, height: size.height)
+        .overlay(outline.stroke(.white.opacity(isSelected ? 0.95
+                                               : (isStick ? 0 : 0.28)),
+                                lineWidth: isSelected ? 2 : 1))
         // A stick must not shrink under the thumb; only round buttons do that.
         .scaleEffect(!isStick && isDown ? 0.92 : 1.0)
         // ml890: no press animation. Pressing the on-screen Enter key killed the
@@ -3885,7 +4144,9 @@ struct MappingPanel: View {
                                            ("LT", .pad("LT")), ("RT", .pad("RT"))])
             section("Sticks", [("LS", .pad("LS")), ("RS", .pad("RS")),
                                ("L3", .pad("L3")), ("R3", .pad("R3"))])
-            section("System", [("Menu", .pad("Menu")), ("View", .pad("View")),
+            // Start and Select are XInput's Menu and View; the layout keeps the
+            // XInput names, the chips and the buttons read Start/Select.
+            section("System", [("Start", .pad("Menu")), ("Select", .pad("View")),
                                ("Guide", .pad("Guide"))])
         }
     }

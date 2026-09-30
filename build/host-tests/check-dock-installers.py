@@ -58,13 +58,13 @@ for switch in ('MADEIRA_DOCK_INSTALLERS', 'MADEIRA_INSTALL_DEFAULT_KEY', 'MADEIR
     require(f'flag("{switch}")' in installers, f'switch {switch} is read')
 require('reg.exe' not in installers, 'the batch never writes the registry (no reg.exe in the bundle)')
 require(content.count('setenv("MADEIRA_MADSYNC_SESSION", "0", 1)') == 1 and
-        'if DockInstallers.serverSync {\n            setenv("MADEIRA_MADSYNC_SESSION", "0", 1)' in content and
+        re.search(r'if DockInstallers\.serverSync \{\n\s*setenv\("MADEIRA_MADSYNC_SESSION", "0", 1\)', content) and
         'unsetenv("MADEIRA_MADSYNC_SESSION")' in content, 'madsync is turned off only for a Dock start that runs installers')
 for name, text in [('MadeiraDock.swift', dock), ('MadeiraDockView.swift', view)]:
     require('MADEIRA_MADSYNC_SESSION' not in text, f'{name}: does not touch the madsync session switch')
 start = content.index('private func startDock(')
 body = content[start:content.index('\n    }\n', start)]
-require(body.index('try MadeiraDock.writeHandoff(') < body.index('DockInstallers.prepare(') < body.index('runWineFullSequence()'),
+require(body.index('try MadeiraDock.writeHandoff(') < body.index('DockInstallers.prepare(') < body.index('runWineFullSequence('),
         'installers are planned after the launch checks, before the session starts')
 require('installers: DockInstallers.script' in body, 'the planned batch goes into the launch arguments')
 require('DockInstallers.poll(drive: MadeiraDock.drive)' in view and 'Picker(game.name' in view and
@@ -266,6 +266,7 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(DockInstallers.programCount(game, drive: drive) == 5, "the sheet's program count")
 
         // ---- prepare(): a first start on a bundle without 32-bit support or msiexec
+        MadeiraConfig.values["inproc-sync"] = "1"   // madsync chosen: the per-session request applies
         try? FileManager.default.removeItem(at: prefix.appendingPathComponent(DockInstallLedger.fileName))
         try write(prefix.appendingPathComponent("system.reg"), "WINE REGISTRY Version 2\n\n[Software\\\\Wow6432Node\\\\Fixture Shared] 1700000000\n\"Shared Runtime\"=dword:00000001\n")
         try write(prefix.appendingPathComponent("user.reg"), "WINE REGISTRY Version 2\n")
@@ -286,8 +287,21 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(DockInstallers.poll(drive: drive) == "Starting this game's one-time installs…", "progress before the batch starts")
         try write(drive.appendingPathComponent("madeira-dock-installers.result"), "begin 1 \r\nservices started\r\nstart 1 tool \r\n")
         require(DockInstallers.poll(drive: drive) == "Running one-time install 1 of 1: tool…" && logged("services=started") && logged("start 1/1 program=tool"), "progress while running")
-        try write(drive.appendingPathComponent("madeira-dock-installers.result"), "begin 1 \r\nservices started\r\nstart 1 tool \r\nexit 1 0 \r\nend \r\n")
-        require(DockInstallers.poll(drive: drive) == "One-time installs finished." && logged("exit 1/1 program=tool status=0 succeeded"), "progress when finished")
+        require(DockInstallers.finishedAt == nil, "not finished while a program runs")
+        let finished = "begin 1 \r\nservices started\r\nstart 1 tool \r\nexit 1 0 \r\nend \r\n"
+        try write(drive.appendingPathComponent("madeira-dock-installers.result"), finished)
+        require(DockInstallers.poll(drive: drive) == "One-time installs finished: 1 of 1 succeeded." && logged("exit 1/1 program=tool status=0 succeeded"), "progress when finished")
+        let ended = DockInstallers.finishedAt
+        _ = DockInstallers.poll(drive: drive)
+        require(ended != nil && DockInstallers.finishedAt == ended &&
+                LogStore.shared.lines.filter({ $0.contains("[dock-installers] end succeeded=1 failed=0 of=1; the host starts next") }).count == 1,
+                "the end is logged once and its time kept (the starting screen times the host from it)")
+        // The words count what succeeded and name what failed (the text reads only the result file).
+        try write(drive.appendingPathComponent("madeira-dock-installers.result"),
+                  "begin 3 \r\nservices started\r\nstart 1 tool \r\nexit 1 0 \r\nstart 2 b \r\nexit 2 5 \r\nstart 3 c \r\nexit 3 -1073741819 \r\nend \r\n")
+        require(DockInstallers.poll(drive: drive) == "One-time installs finished: 1 of 3 succeeded.\nFailed: b (exit 5), c (exit -1073741819)",
+                "finished with failures: how many succeeded, which failed")
+        try write(drive.appendingPathComponent("madeira-dock-installers.result"), finished)
 
         // ---- the next start records the result and plans again: nothing is left to run
         DockInstallers.prepare(game, drive: drive, prefix: prefix, has32Bit: false, hasMsiexec: false, fusionSource: nil)
@@ -296,7 +310,8 @@ func pe(_ url: URL, machine: UInt16) throws {
                 system.contains("[SOFTWARE\\\\Fixture Tool]"), "a program that exited 0 is recorded in both views at the next start")
         require(FileManager.default.fileExists(atPath: prefix.appendingPathComponent("system.reg.madeira-bak").path), "a backup of system.reg is kept once")
         require(logged("results reason=next-start succeeded=1 failed=0 recorded-values=2 services=started ended=1 statuses=tool=0"), "one summary line")
-        require(DockInstallers.script == nil && !DockInstallers.serverSync, "nothing pending: no batch, madsync untouched")
+        require(DockInstallers.script == nil && !DockInstallers.serverSync && DockInstallers.finishedAt == nil,
+                "nothing pending: no batch, madsync untouched, no installs' end")
         require(!FileManager.default.fileExists(atPath: drive.appendingPathComponent("madeira-dock-installers.result").path) &&
                 DockInstallLedger.load(prefix: prefix).session.isEmpty, "result file and session list cleared")
 
@@ -336,6 +351,11 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(!DockInstallers.serverSync && ((try? String(contentsOf: drive.appendingPathComponent("madeira-dock-installers.cmd"), encoding: .utf8)) ?? "").contains("--start-services"),
                 "madsync already off in madeira.cfg: the service step runs without a session request")
         MadeiraConfig.values = [:]
+        DockInstallers.setRunsNext(7000, true, prefix: prefix)
+        DockInstallers.prepare(game, drive: drive, prefix: prefix, has32Bit: true, hasMsiexec: false, fusionSource: nil)
+        require(!DockInstallers.serverSync && ((try? String(contentsOf: drive.appendingPathComponent("madeira-dock-installers.cmd"), encoding: .utf8)) ?? "").contains("--start-services")
+                && !(DockInstallers.note ?? "").contains("standard synchronization"),
+                "no inproc-sync (fastsync, the default engine): the service step runs, no madsync note")
         unsetenv("MADEIRA_DOCK_INSTALL_SERVER_SYNC")
         setenv("MADEIRA_DOCK_INSTALL_SCM", "0", 1)
         DockInstallers.setRunsNext(7000, true, prefix: prefix)
@@ -423,12 +443,12 @@ with tempfile.TemporaryDirectory(prefix='madeira-dock-installers-') as tmp:
             return int(re.search(r'madsync=(\d)', out.stdout).group(1)), out.stderr
 
         on, log = madsync_run()
-        require(on == 1 and 'ENABLED' in log and 'off for this session' not in log, 'no madeira.cfg, no session switch: madsync on (default unchanged)')
-        require(madsync_run('inproc-sync = 1\n')[0] == 1 and madsync_run('other = 1\n')[0] == 1, 'madeira.cfg with or without the key: on')
+        require(on == 0 and 'disabled' in log and 'off for this session' not in log, 'no madeira.cfg, no session switch: madsync off (fastsync is the default)')
+        require(madsync_run('inproc-sync = 1\n')[0] == 1 and madsync_run('other = 1\n')[0] == 0, 'madsync only with inproc-sync = 1')
         require(madsync_run('inproc-sync = 0\n')[0] == 0, 'inproc-sync = 0 still turns it off')
-        on, log = madsync_run(session='0')
+        on, log = madsync_run('inproc-sync = 1\n', session='0')
         require(on == 0 and '[madsync] off for this session (MADEIRA_MADSYNC_SESSION=0' in log, 'MADEIRA_MADSYNC_SESSION=0: off for this session, logged')
-        require(all(madsync_run(session=v)[0] == 1 for v in ('1', '', '00', 'off', '0 ')), 'any other session value leaves madsync on')
+        require(all(madsync_run('inproc-sync = 1\n', session=v)[0] == 1 for v in ('1', '', '00', 'off', '0 ')), 'any other session value leaves madsync on')
         require(madsync_run('inproc-sync = 0\n', session='1')[0] == 0, 'the session switch never turns madsync on')
 
 # ---- optional: run the generated batch with Windows cmd.exe (WSL interop)

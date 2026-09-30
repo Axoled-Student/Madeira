@@ -87,7 +87,7 @@ unix side. The page past `B + 4 GB` is an overrun guard.
 |---|---|---|
 | Machine | `IMAGE_FILE_HEADER.Machine` read off disk: a `C:\...` path under the prefix's `drive_c`, or a bare name found in the bundle's `i386-windows` and in neither 64-bit farm | not probed further; the existing name heuristic decides, unchanged |
 | Session core | plain `aarch64-windows` (a WoW64 process's 64-bit half is aarch64) | unchanged |
-| Farms | `C:\windows\syswow64` -> `i386-windows`, plus `syswow64\wbem` and the x86 side-by-side store in `C:\windows\winsxs` | `syswow64` is linked when the bundle has the i386 set, so a 64-bit launcher can start a 32-bit child; nothing else |
+| Farms | `C:\windows\syswow64` -> `i386-windows`, plus `syswow64\wbem` and the x86 side-by-side store in `C:\windows\winsxs` | the same three, whenever the bundle has the i386 set: a 64-bit launcher (or the Dock host) starts 32-bit children, and the store's links name the bundle path, which changes on reinstall |
 | Bare name | `C:\windows\syswow64\<name>` | `C:\windows\system32\<name>` |
 | Before `__wine_main` | `ios_main_image_i386 = 1`; `FEX_MADEIRA_HOSTPROBE` published | `ios_main_image_i386 = 0`; `FEX_MADEIRA_HOSTPROBE` published only if the bundle has the i386 set |
 
@@ -116,8 +116,9 @@ caller's bitness; a library without a 32-bit table refuses a 32-bit caller
 instead of handing it the 64-bit table. 64-bit callers get the same tables
 from the same branches as before. Tables provided: winemetal (DXMT's Metal
 renderer; the 32-bit table lives in DXMT's `winemetal_unix.c`), ws2_32,
-bcrypt, secur32, crypt32, dwrite, nsi (TCP table) and the audio driver (on
-the existing engine). win32u goes through `wow64win.dll`.
+bcrypt, secur32, crypt32, dwrite, nsi (TCP connections, network interfaces,
+addresses and routes, and the row/field reads) and the audio driver (on the
+existing engine). win32u goes through `wow64win.dll`.
 
 ### Direct3D 9
 
@@ -177,8 +178,10 @@ behaviour.
 
 The series does not change the 64-bit engine's defaults. In particular:
 
-- madsync stays on (`inproc-sync` defaults to 1 in `build/madsync/madsync.c`);
-  the series adds no other in-process sync engine.
+- madsync stays on (`inproc-sync` defaulted to 1 in `build/madsync/madsync.c`);
+  the series adds no other in-process sync engine. (Fastsync, added later, has
+  been the default engine since 2026-09-30; `inproc-sync = 1` still selects
+  madsync.)
 - The FEX code-buffer cap and ladder (128 MB, ml1052), the owner-aware
   code-buffer guard (ml1035), the bounded sweep retry (ml1106) and the
   ARM64EC alias cache (ml1116) are untouched; the ARM64EC FEX DLL builds to

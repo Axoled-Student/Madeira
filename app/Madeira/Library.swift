@@ -157,6 +157,10 @@ struct LibraryEntry: Codable, Identifiable {
     var bits: Int
     /// A user-chosen cover in Documents/madeira-art/.
     var coverFile: String?
+    /// The Steam store app this game was matched to (Game details › Find on
+    /// Steam). Only its public artwork is used: the library cover and the
+    /// starting screen's background, when no cover file is chosen.
+    var steamID: Int?
     var arguments = ""
     /// The virtual monitor's size ("WxH"): the session default a game renders
     /// for (GuestDisplay.configureSessionDefault), and the Desktop entry's
@@ -190,12 +194,61 @@ struct LibraryEntry: Codable, Identifiable {
     /// nil = 1) in this game's sessions.
     var controlOpacity: Double?
     var controlSize: Double?
+    /// Processors reported to Windows code in this game's sessions
+    /// (MADEIRA_CPU_COUNT, ntdll); nil = automatic.
+    var cpuCount: Int?
+    /// D3D9 anisotropic filtering limit (DXMT_D9_ANISO_LIMIT: 1, 2, 4 or 8);
+    /// nil = the application's own choice.
+    var anisotropyLimit: Int?
+    /// A Steam game (SteamGames.swift): Madeira Dock starts it by this App ID
+    /// through Valve's client, with Steam's default launch option.
+    /// `relativePath` is then its install folder, relative to drive_c.
+    var steamAppID: Int?
+    /// How a Steam game starts (Game details › Steam › Start with): nil is Madeira
+    /// Dock, the default; "game" is the game's own program in Wine, without Steam
+    /// (SteamDirectStart).
+    var steamStart: String?
+    /// "The game": the program, relative to the install folder ("bin/game.exe"), its
+    /// arguments, and its working folder (relative to the install folder; nil: the
+    /// program's own folder, "": the install folder), from Steam's launch configuration
+    /// for the app ("steam"), the Program picker ("choice") or the folder's only
+    /// program ("only").
+    var steamProgram: String?
+    var steamProgramArguments: String?
+    var steamProgramFolder: String?
+    var steamProgramSource: String?
+    /// The install folder, build and picked program a Steam game's `bits` and
+    /// `graphicsAPI` were read for, and whether Steam's launch configuration was
+    /// cached (LibraryModel.refreshSteamMetadata); any change reads them again.
+    var steamMetadataInstall: String?
+    /// Fastsync's per-game switches, used only while Settings › Sync engine is
+    /// Fastsync: "Fast synchronization" (nil = on; off gives this game Wine's
+    /// standard sync) and "Fast semaphore waits" (nil = off). Optional, so older
+    /// library files decode; the fork's files carry the same keys.
+    var fastSync: Bool?
+    var semaphoreFastPath: Bool?
 
     var displayMode: DisplayMode { display.flatMap(DisplayMode.init(rawValue:)) ?? .fit }
 
     var launchArguments: String {
         if desktop == true { return "/desktop=shell,\(resolution) C:\\windows\\system32\\services.exe" }
+        if startsSteamGameDirectly { return steamProgramArguments ?? "" }
         return arguments
+    }
+
+    /// A Steam game that starts as its own program ("Start with: The game").
+    var startsSteamGameDirectly: Bool { steamAppID != nil && steamStart == "game" }
+    /// What a launch starts, relative to drive_c: "The game"'s program inside the
+    /// install folder, else `relativePath`.
+    var launchRelativePath: String {
+        guard startsSteamGameDirectly, let program = steamProgram, !program.isEmpty else { return relativePath }
+        return relativePath + "/" + program
+    }
+    var launchWindowsPath: String { "C:\\" + launchRelativePath.replacingOccurrences(of: "/", with: "\\") }
+    /// "The game"'s working folder as a Windows path, or nil for the program's own folder.
+    var steamWorkingWindowsPath: String? {
+        guard startsSteamGameDirectly, let folder = steamProgramFolder else { return nil }
+        return "C:\\" + (folder.isEmpty ? relativePath : relativePath + "/" + folder).replacingOccurrences(of: "/", with: "\\")
     }
 
     static let desktopID = UUID(uuidString: "AF046C35-C32A-497B-92BC-0BBD14F8CB61")!
@@ -214,7 +267,9 @@ struct LibraryEntry: Codable, Identifiable {
     func validate() throws {
         let size = resolution.split(separator: "x").compactMap { Int($0) }
         guard size.count == 2, (320...4096).contains(size[0]), (240...4096).contains(size[1]),
-              (0...3).contains(fpsMode), !arguments.contains("\0"), !windowsPath.contains("\0") else {
+              (0...3).contains(fpsMode), !arguments.contains("\0"), !windowsPath.contains("\0"),
+              !launchArguments.contains("\0"), !launchWindowsPath.contains("\0"),
+              launchWindowsPath.utf8.count < 1024, (steamWorkingWindowsPath?.utf8.count ?? 0) < 512 else {
             throw LibraryError.message("The saved launch profile contains invalid display or argument values.")
         }
         var quoted = false, inToken = false, tokens = 0
@@ -233,6 +288,17 @@ struct LibraryEntry: Codable, Identifiable {
         configureLaunch()
         // Unset unless chosen: FEX's own default then applies, as for any other launch.
         if reducedX87 { setenv("FEX_X87REDUCEDPRECISION", "1", 1) } else { unsetenv("FEX_X87REDUCEDPRECISION") }
+        // Exported only when chosen: unset keeps the engine's own default (and any
+        // madeira.cfg setting), as before these choices existed.
+        if let cpuCount, (1..<64).contains(cpuCount) { setenv("MADEIRA_CPU_COUNT", String(cpuCount), 1) }
+        if let anisotropyLimit, [1, 2, 4, 8].contains(anisotropyLimit) { setenv("DXMT_D9_ANISO_LIMIT", String(anisotropyLimit), 1) }
+        // Fastsync's per-game switches, only when Settings chose Fastsync; with Madsync
+        // (the default) or Wine's standard sync nothing is exported here.
+        if SyncEngine.current == .fastsync {
+            let mode = MadeiraConfig.get("env.MADEIRA_FASTSYNC") ?? "auto"
+            setenv("MADEIRA_FASTSYNC", fastSync == false ? "0" : mode, 1)
+            setenv("MADEIRA_FASTSYNC_SEM", semaphoreFastPath == true ? "1" : "0", 1)
+        }
         madeira_set_vsync_locked(effectiveFPSMode)
         fputs("[frontend] launch profile applied\n", stderr)
         LogStore.shared.log("[display-shape] resolution=\(resolution) mode=\(displayMode.rawValue)")
@@ -240,9 +306,28 @@ struct LibraryEntry: Codable, Identifiable {
 
     /// What the bridge starts. Set on the main thread before the session begins.
     func configureLaunch() {
-        setenv("MADEIRA_EXE", desktop == true ? "explorer.exe" : windowsPath, 1)
+        // "The game"'s identity and working folder for this launch only (the bridge
+        // reads and clears them); every other launch starts without them.
+        unsetenv("MADEIRA_STEAM_APPID"); unsetenv("MADEIRA_STEAM_APPPATH"); unsetenv("MADEIRA_WORKDIR")
+        if steamAppID != nil {
+            // A Steam game through Madeira Dock: Dock has set what starts (ContentView.startDock);
+            // the virtual monitor follows this entry's Resolution, as below. "The game" starts
+            // its own program below, like any library game.
+            if !startsSteamGameDirectly {
+                GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
+                return
+            }
+        }
+        setenv("MADEIRA_EXE", desktop == true ? "explorer.exe" : launchWindowsPath, 1)
         setenv("MADEIRA_ARGS", launchArguments, 1)
         if desktop == true { setenv("MADEIRA_DESKTOP", "1", 1) } else { unsetenv("MADEIRA_DESKTOP") }
+        if startsSteamGameDirectly, let steamAppID {
+            // The game's own Steam identity (SteamAppId, SteamGameId, SteamAppPath = its install
+            // folder) instead of the bridge's fixed one, and Steam's working folder when it names one.
+            setenv("MADEIRA_STEAM_APPID", String(steamAppID), 1)
+            setenv("MADEIRA_STEAM_APPPATH", windowsPath, 1)
+            if let folder = steamWorkingWindowsPath { setenv("MADEIRA_WORKDIR", folder, 1) }
+        }
         // Every session's virtual monitor takes this entry's Resolution
         // (MADEIRA_SCREEN_W/H, source "knob"); for the Desktop entry it is the
         // same size as its /desktop= argument.
@@ -300,6 +385,7 @@ final class LibraryModel: ObservableObject {
     }
     private var readOnly = false
     private var metadataInFlight = Set<UUID>()
+    private var steamMetadataInFlight = Set<Int>()
     private var savedControls: [TouchControl] = []
     private var savedLayout: String?
     private var savedVisible = true
@@ -335,10 +421,14 @@ final class LibraryModel: ObservableObject {
         guard !readOnly else { error = "The library file could not be read. Preserve or repair it before making changes."; return }
         var next = entries
         var entry = entry
-        if let i = next.firstIndex(where: { $0.id == entry.id }) {
+        // A Steam game has one entry: a details page opened before its card first saved
+        // one (refreshSteamMetadata) updates that entry.
+        if let i = next.firstIndex(where: { $0.id == entry.id }) ??
+            next.firstIndex(where: { entry.steamAppID != nil && $0.steamAppID == entry.steamAppID }) {
             // A details sheet may predate an asynchronous metadata refresh.
             if (next[i].metadataChecked ?? .distantPast) > (entry.metadataChecked ?? .distantPast) {
                 entry.folderBytes = next[i].folderBytes; entry.graphicsAPI = next[i].graphicsAPI
+                entry.bits = next[i].bits; entry.steamMetadataInstall = next[i].steamMetadataInstall
                 entry.metadataChecked = next[i].metadataChecked
                 entry.metadataRevision = next[i].metadataRevision
             }
@@ -348,6 +438,34 @@ final class LibraryModel: ObservableObject {
     }
     func remove(_ id: UUID) {
         persist(entries.filter { $0.id != id })
+    }
+    /// A Steam game's library entry, which holds its per-game settings
+    /// (SteamGames.swift). A game without one gets a new entry made from what
+    /// Steam installed; it is saved when its details page closes or it is
+    /// played. An existing entry follows the install folder Steam records.
+    func steamEntry(_ game: DockGame, title: String? = nil) -> LibraryEntry {
+        let folder = game.library + "/common/" + game.installDir
+        if var entry = entries.first(where: { $0.steamAppID == game.id }) {
+            entry.relativePath = folder
+            return entry
+        }
+        var entry = LibraryEntry(title: title ?? game.name, relativePath: folder, bits: 0)
+        entry.steamAppID = game.id
+        entry.folderBytes = SteamInstallFiles.sizeOnDisk(appID: game.id, steamApps: Self.drive.appendingPathComponent(game.library, isDirectory: true))
+        return entry
+    }
+    /// A Steam download finished (SteamOwnedLibrary): the game gets its library
+    /// entry, or an existing one keeps its title, artwork and settings.
+    func upsertSteam(_ game: DockGame, title: String) {
+        guard !readOnly else { return }
+        var entry = steamEntry(game, title: title)
+        entry.folderBytes = SteamInstallFiles.sizeOnDisk(appID: game.id, steamApps: Self.drive.appendingPathComponent(game.library, isDirectory: true)) ?? entry.folderBytes
+        save(entry)
+    }
+    /// A Steam game was uninstalled: its entry goes with its files.
+    func removeSteam(appID: Int) {
+        guard entries.contains(where: { $0.steamAppID == appID }) else { return }
+        persist(entries.filter { $0.steamAppID != appID })
     }
     private func persist(_ next: [LibraryEntry]) {
         guard !readOnly else { return }
@@ -373,6 +491,55 @@ final class LibraryModel: ObservableObject {
         if let api = result.api { updated.graphicsAPI = api }
         updated.metadataChecked = Date(); updated.metadataRevision = revision; save(updated)
         fputs("[library-metadata] install scan api=\(updated.graphicsAPI ?? "unknown") bytes=\(result.bytes ?? -1)\n", stderr)
+    }
+
+    /// An installed Steam game's library pills (SteamGames.swift): 32-bit or 64-bit and
+    /// the graphics API of the program "Start with: The game" would start
+    /// (SteamDirectStart.program), and the install size from Steam's install record.
+    /// Read off the main thread once per install folder, build and picked program
+    /// (again when Steam's launch configuration arrives, or after a day while no
+    /// program is known) and kept on the game's entry.
+    @MainActor
+    func refreshSteamMetadata(_ game: DockGame, title: String) async {
+        let revision = 1
+        guard !readOnly, game.installed, !steamMetadataInFlight.contains(game.id) else { return }
+        steamMetadataInFlight.insert(game.id)
+        defer { steamMetadataInFlight.remove(game.id) }
+        let drive = Self.drive
+        let folder = game.library + "/common/" + game.installDir
+        let root = drive.appendingPathComponent(folder, isDirectory: true)
+        let steamApps = drive.appendingPathComponent(game.library, isDirectory: true)
+        let record = await Task.detached(priority: .utility) {
+            (build: SteamInstallFiles.buildID(appID: game.id, steamApps: steamApps),
+             size: SteamInstallFiles.sizeOnDisk(appID: game.id, steamApps: steamApps))
+        }.value
+        let stored = entries.first { $0.steamAppID == game.id }
+        let picked = stored?.steamProgramSource == "choice" ? stored?.steamProgram : nil
+        let known = SteamOwnedLibrary.shared.game(game.id)?.launches != nil
+        let install = "\(folder)#\(record.build ?? 0)#\(picked ?? "")#\(known ? 1 : 0)"
+        if let stored, stored.steamMetadataInstall == install, stored.metadataRevision == revision,
+           stored.bits != 0 || Date().timeIntervalSince(stored.metadataChecked ?? .distantPast) < 86400 { return }
+        // Steam's launch configuration is asked for only when no picked program is installed.
+        let kept = await Task.detached(priority: .utility) { picked.flatMap { SteamDirectStart.onDisk($0, in: root, directory: false) } }.value
+        let options = kept == nil ? await SteamOwnedLibrary.shared.launchOptions(appID: game.id) : nil
+        let program = await Task.detached(priority: .utility) { () -> (url: URL, bits: Int, api: String?)? in
+            guard let path = SteamDirectStart.program(picked: kept, options: options, installFolder: root),
+                  let inspected = try? LibraryModel.inspect(root.appendingPathComponent(path)) else { return nil }
+            return (root.appendingPathComponent(path), inspected.bits, inspected.graphicsAPI)
+        }.value
+        var api = program?.api
+        if let program, let scanned = await LibraryMetadataScanner.shared.scan(program.url, drive: drive, countBytes: false).api { api = scanned }
+        guard !Task.isCancelled else { return }
+        var updated = entries.first { $0.steamAppID == game.id } ?? LibraryEntry(title: title, relativePath: folder, bits: 0)
+        updated.steamAppID = game.id
+        updated.relativePath = folder
+        updated.bits = program?.bits ?? 0
+        updated.graphicsAPI = api
+        updated.folderBytes = record.size ?? updated.folderBytes
+        updated.steamMetadataInstall = install
+        updated.metadataChecked = Date(); updated.metadataRevision = revision
+        save(updated)
+        LogStore.shared.log("[steam-games] metadata app=\(game.id) bits=\(updated.bits) api=\(api ?? "unknown")")
     }
 
     static func executable(_ relative: String) throws -> URL {
@@ -488,7 +655,8 @@ final class LibraryModel: ObservableObject {
 
     /// `remember: false` runs a session that is not a library entry (a Madeira
     /// Dock start): it is neither added to the library nor stamped as played.
-    func begin(_ entry: LibraryEntry, remember: Bool = true) {
+    /// `dock`: the game a Madeira Dock start launches (DockStartScreen).
+    func begin(_ entry: LibraryEntry, remember: Bool = true, dock: DockGame? = nil) {
         wine_exit_status_reset()
         quitRequested = false
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
@@ -519,12 +687,21 @@ final class LibraryModel: ObservableObject {
         ProMotionIntent.apply(mode: entry.effectiveFPSMode)
         if remember { var played = entry; played.lastPlayed = Date(); save(played) }
         launchDismissLogged = false
+        DockStartScreen.shared.begin(dock, at: launchStarted)
         sawProcess = false
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.poll() }
     }
     private func poll() {
-        if launching {
+        let dockStart = DockStartScreen.shared
+        if dockStart.active {
+            // A Dock start: the desktop's own frames (explorer, the host's console window)
+            // do not end this starting screen; the game's window does (DockStartScreen).
+            dockStart.poll(self, rendered: madeira_get_present_count() >= launchPresent + 3)
+        }
+        if dockStart.holding {
+            if launching && !launchSlow && Date().timeIntervalSince(launchStarted) > 30 { launchSlow = true }
+        } else if launching {
             if madeira_get_present_count() >= launchPresent + 3 {
                 showGameView(reason: "present")
             } else if winios_surface_present_count() > launchSurface {
@@ -612,6 +789,7 @@ final class LibraryModel: ObservableObject {
         displayMode = .fit
         LogStore.shared.setDisplayActive(true)
         launching = false; launchLogs = false; LibraryKeyboard.hide()
+        DockStartScreen.shared.finish()
         LibraryController.shared.configure(enabled: enabled, ownsInput: enabled)
         MetalHostView.shared.isHidden = true
         ProMotionIntent.shared.setActive(false)
@@ -656,7 +834,8 @@ private actor LibraryMetadataScanner {
         }
         return result
     }
-    func scan(_ executable: URL, drive: URL) -> (bytes: Int64?, api: String?) {
+    /// `countBytes: false` skips the size walk (a Steam game's size is its install record's).
+    func scan(_ executable: URL, drive: URL, countBytes: Bool = true) -> (bytes: Int64?, api: String?) {
         let folder = executable.deletingLastPathComponent()
         guard folder.path.hasPrefix(drive.path + "/"), !Task.isCancelled else { return (nil, nil) }
         let manager = FileManager.default
@@ -673,7 +852,7 @@ private actor LibraryMetadataScanner {
         }
         var complete = true
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
-        let walker = manager.enumerator(at: installation, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { _, _ in complete = false; return true })
+        let walker = countBytes ? manager.enumerator(at: installation, includingPropertiesForKeys: Array(keys), options: [], errorHandler: { _, _ in complete = false; return true }) : nil
         var bytes: Int64 = 0
         var files = 0
         while let file = walker?.nextObject() as? URL {
@@ -1009,6 +1188,30 @@ struct LibraryNavSearch: UIViewControllerRepresentable {
     }
 }
 
+struct SteamMatch: Decodable, Identifiable {
+    let id: Int
+    let name: String
+    let tiny_image: String?
+}
+
+/// The public Steam store: title search and store artwork for an app ID. No
+/// account, credentials, or private library access.
+enum SteamCatalog {
+    static func search(_ text: String) async throws -> [SteamMatch] {
+        var url = URLComponents(string: "https://store.steampowered.com/api/storesearch/")!
+        url.queryItems = [URLQueryItem(name: "term", value: text), URLQueryItem(name: "l", value: "english"), URLQueryItem(name: "cc", value: "US")]
+        var request = URLRequest(url: url.url!); request.timeoutInterval = 15
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200, data.count < 2_000_000 else {
+            throw LibraryError.message("Steam search is unavailable. You can still edit the title and artwork manually.")
+        }
+        struct Results: Decodable { var items: [SteamMatch] }
+        return Array(try JSONDecoder().decode(Results.self, from: data).items.prefix(30))
+    }
+    static func cover(_ id: Int) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/library_600x900.jpg") }
+    static func hero(_ id: Int) -> URL? { URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(id)/library_hero.jpg") }
+}
+
 struct LibraryArtwork: View {
     let entry: LibraryEntry
     var backdrop = false
@@ -1021,6 +1224,11 @@ struct LibraryArtwork: View {
                let image = UIImage(contentsOfFile: LibraryModel.documents.appendingPathComponent("madeira-art/" + URL(fileURLWithPath: name).lastPathComponent).path) {
                 Image(uiImage: image).resizable().scaledToFill()
                     .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
+            } else if let id = entry.steamID ?? entry.steamAppID {   // a store match, else the Steam game itself
+                AsyncImage(url: backdrop ? SteamCatalog.hero(id) : SteamCatalog.cover(id)) { image in
+                    image.resizable().scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height, alignment: .center).clipped()
+                } placeholder: { Color.clear }
             }
         }
         .frame(width: geometry.size.width, height: geometry.size.height)
@@ -1031,6 +1239,8 @@ struct LibraryArtwork: View {
 
 struct LibraryBadges: View {
     let entry: LibraryEntry
+    /// A state pill after the format pills (a Steam game's "Update").
+    var note: String? = nil
     var body: some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 4) { format; size }
@@ -1041,6 +1251,7 @@ struct LibraryBadges: View {
         HStack(spacing: 4) {
             if entry.bits == 32 || entry.bits == 64 { badge("\(entry.bits)-bit") }
             if let api = LibraryRendererBadge.compact(entry.graphicsAPI) { badge(api) }
+            if let note { badge(note) }
         }
     }
     @ViewBuilder private var size: some View {
@@ -1114,6 +1325,29 @@ struct LibrarySectionHeader<Trailing: View>: View {
     }
 }
 
+/// A section's cards or rows in the library's layout ("cards", "compact",
+/// "list" or "compactList"): every section of the library page uses it.
+struct LibraryCells<Item: Identifiable, Cell: View>: View {
+    let items: [Item]
+    let layout: String
+    let width: CGFloat
+    @ViewBuilder let cell: (_ item: Item, _ list: Bool, _ dense: Bool) -> Cell
+    var body: some View {
+        if layout == "list" || layout == "compactList" {
+            let dense = layout == "compactList"
+            LazyVStack(spacing: dense ? 4 : 8) { ForEach(items) { item in cell(item, true, dense) } }
+        } else {
+            let compact = layout == "compact"
+            let width = max(1, min(self.width, 1100) - 32)
+            let count = max(1, Int((width + 12) / (compact ? 110 : 154)))
+            let cardWidth = min(compact ? 115.0 : 164.0, (width - CGFloat(count - 1) * 12) / CGFloat(count))
+            LazyVGrid(columns: Array(repeating: GridItem(.fixed(cardWidth), spacing: 12, alignment: .top), count: count), alignment: .center, spacing: 18) {
+                ForEach(items) { item in cell(item, false, false) }
+            }.frame(maxWidth: .infinity, alignment: .center)
+        }
+    }
+}
+
 struct LibraryView: View {
     @ObservedObject private var model = LibraryModel.shared
     @Environment(\.scenePhase) private var scenePhase
@@ -1140,10 +1374,14 @@ struct LibraryView: View {
     @State private var settingsRefresh = 0
     @AppStorage("madeiraLibraryLayout") private var layout = "cards"
     @AppStorage("madeiraLibrarySort") private var sort = "played"
-    // Collapsed state of the games section.
-    @AppStorage("madeiraLibraryHideOthers") private var hideGames = false
+    // Collapsed state of the Other games section (MADEIRA_LIBRARY_COLLAPSE=0: no collapsing).
+    @AppStorage("madeiraLibraryHideOthers") private var hideOthers = false
+    // The sections follow the Steam section's games and sign-in (SteamGames.swift).
+    @ObservedObject private var steamGames = SteamGamesModel.shared
+    @ObservedObject private var steamLibrary = SteamOwnedLibrary.shared
     private var entries: [LibraryEntry] {
-        let visible = model.entries.filter { $0.desktop != true && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
+        // Steam games are listed in their own section (SteamGames.swift).
+        let visible = model.entries.filter { $0.desktop != true && $0.steamAppID == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
         if sort == "added" { return visible.reversed() }
         return visible.sorted {
             if sort == "played", $0.lastPlayed != $1.lastPlayed { return ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
@@ -1185,6 +1423,9 @@ struct LibraryView: View {
             EndedSessionSurface.install(); EndedSessionSurface.hide(reason: "library-appeared")
             // First-run setup opens once on a new install.
             onboarding.presentIfNeeded()
+        }
+        .onAppear {
+            LogStore.shared.log("[library-sections] native-steam=\(SteamOwnedLibrary.enabled ? 1 : 0) sections=\(SteamGamesSection.shown ? 1 : 0) collapse=\(SteamGamesSection.collapsible ? 1 : 0)")
         }
         .onReceive(controller.commands) { command in
             if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
@@ -1316,25 +1557,48 @@ struct LibraryView: View {
                         .id(LibraryEntry.desktopID)
                         .overlay(RoundedRectangle(cornerRadius: 22).stroke(focused == LibraryEntry.desktopID && controller.connected ? Color.cyan : .clear, lineWidth: 3))
                 }
-                // Installed Steam games, started through Madeira Dock (SteamGames.swift).
-                SteamGamesSection(search: search, startDock: startDock)
-                if model.entries.filter({ $0.desktop != true }).isEmpty {
-                    ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
-                } else {
+                // The library's sections, as in the fork: Steam (installed and downloading
+                // Steam games, then Not installed), then Other games, the games you added.
+                // Steam games start through Madeira Dock (SteamGames.swift); an installed one
+                // opens its Game details page like any library game. Without the Steam
+                // section the games you added are one grid.
+                // Installed Steam games first, then the games you added, then the
+                // account's Not installed games. With nothing installed (or
+                // downloading) the games you added are the top section and the
+                // whole Steam section, sign-in included, follows them.
+                let steamFirst = MadeiraDock.enabled && SteamGamesSection.hasInstalled
+                if steamFirst {
+                    SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
+                                      part: .installed, open: { selected = $0 })
+                }
+                if SteamGamesSection.shown {
                     VStack(alignment: .leading, spacing: 14) {
                         // Games are added with the + in the navigation bar.
-                        LibrarySectionHeader(title: "Games", count: entries.count, collapsed: $hideGames) { EmptyView() }
-                        if hideGames {
+                        LibrarySectionHeader(title: "Other games", count: entries.count,
+                                             collapsed: SteamGamesSection.collapsible ? $hideOthers : nil) { EmptyView() }
+                        if hideOthers && SteamGamesSection.collapsible {
                             EmptyView()
                         } else if entries.isEmpty {
-                            Text("No games match your search.").foregroundStyle(.secondary)
+                            Text(search.isEmpty
+                                 ? "Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."
+                                 : "No other games match your search.")
+                                .foregroundStyle(.secondary)
                         } else {
                             cells(entries, width: viewport.size.width)
                         }
                     }
+                    if MadeiraDock.enabled {
+                        SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,
+                                          part: steamFirst ? .notInstalled : .all, open: { selected = $0 })
+                    }
+                } else if model.entries.filter({ $0.desktop != true && $0.steamAppID == nil }).isEmpty {
+                    ContentUnavailableView("Make yourself at home", systemImage: "gamecontroller", description: Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap + and choose its .exe."))
+                } else {
+                    cells(entries, width: viewport.size.width)
                 }
             }.padding(16).frame(maxWidth: 1100).frame(maxWidth: .infinity)
         }
+        .refreshable { await SteamGamesSection.refresh() }
         .onReceive(controller.commands) { command in
             guard tab == 0, selected == nil, !browser, !onboarding.presented else { return }
             let items = entries
@@ -1378,18 +1642,9 @@ struct LibraryView: View {
         }
         }
     }
-    @ViewBuilder private func cells(_ items: [LibraryEntry], width viewportWidth: CGFloat) -> some View {
-        if layout == "list" || layout == "compactList" {
-            let dense = layout == "compactList"
-            LazyVStack(spacing: dense ? 4 : 8) { ForEach(items) { entry in libraryItem(entry, list: true, dense: dense) } }
-        } else {
-            let compact = layout == "compact"
-            let width = max(1, min(viewportWidth, 1100) - 32)
-            let count = max(1, Int((width + 12) / (compact ? 110 : 154)))
-            let cardWidth = min(compact ? 115.0 : 164.0, (width - CGFloat(count - 1) * 12) / CGFloat(count))
-            LazyVGrid(columns: Array(repeating: GridItem(.fixed(cardWidth), spacing: 12, alignment: .top), count: count), alignment: .center, spacing: 18) {
-                ForEach(items) { entry in libraryItem(entry, list: false) }
-            }.frame(maxWidth: .infinity, alignment: .center)
+    private func cells(_ items: [LibraryEntry], width viewportWidth: CGFloat) -> some View {
+        LibraryCells(items: items, layout: layout, width: viewportWidth) { entry, list, dense in
+            libraryItem(entry, list: list, dense: dense)
         }
     }
     private func libraryItem(_ entry: LibraryEntry, list: Bool, dense: Bool = false) -> some View {
@@ -1475,9 +1730,13 @@ struct LibraryDetail: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var model = LibraryModel.shared
     @State private var importCover = false
+    @State private var findCover = false
     @State private var remove = false
     @State private var leaving = false
     @State private var error: String?
+    /// Settings › Sync engine, read when the details open: the fastsync switches
+    /// below only apply while it is Fastsync.
+    @State private var syncEngine = SyncEngine.current
     static let presetResolutions = ["640x480", "800x600", "960x540", "1024x768", "1280x720", "1280x960", "1408x648", "1920x1080", "2560x1440"]
     /// The presets, plus a stored size that is none of them (a screen shape
     /// chosen on another device), so the picker never shows a blank choice.
@@ -1498,6 +1757,20 @@ struct LibraryDetail: View {
     }
     private func start() {
         guard !leaving else { return }
+        // A Steam game starts through Madeira Dock (ContentView.launchLibraryEntry)
+        // once its files are complete and Dock can sign in; "The game" once its
+        // program is chosen (no client or sign-in involved).
+        if let appID = entry.steamAppID {
+            if SteamOwnedLibrary.shared.downloads[appID] != nil {
+                error = "This game's update has not finished. Resume it and wait for it to complete before playing."; return
+            }
+            let installed = SteamGamesModel.shared.games.first { $0.id == appID }?.installed ?? false
+            if entry.startsSteamGameDirectly {
+                if let blocker = SteamDirectStart.blocker(installed: installed, program: entry.steamProgram) { error = blocker; return }
+            } else if let blocker = SteamGamesRules.blocker(installed: installed, client: MadeiraDock.clientInstalled, signedIn: SteamSignIn.isSignedIn) {
+                error = blocker; return
+            }
+        }
         leaving = true
         let profile = entry
         // Give the pressed state a display turn before saving and handing off.
@@ -1505,16 +1778,26 @@ struct LibraryDetail: View {
             model.save(profile); play(profile)
         }
     }
+    /// A Steam game without a chosen cover shows Steam's store artwork.
+    @ViewBuilder private func artwork(backdrop: Bool) -> some View {
+        if let appID = entry.steamAppID, entry.coverFile == nil {
+            SteamGameArtwork(appID: appID)
+        } else {
+            LibraryArtwork(entry: entry, backdrop: backdrop)
+        }
+    }
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     HStack(spacing: 20) {
-                        LibraryArtwork(entry: entry).frame(width: 120, height: 180).clipShape(RoundedRectangle(cornerRadius: 14))
+                        artwork(backdrop: false).frame(width: 120, height: 180).clipShape(RoundedRectangle(cornerRadius: 14))
                         VStack(alignment: .leading, spacing: 12) {
                             Text(entry.title).font(.title2.bold())
                             LibraryBadges(entry: entry)
-                            if let played = entry.lastPlayed {
+                            if let appID = entry.steamAppID, let summary = SteamOwnedLibrary.shared.playtime[appID]?.summary {
+                                Text(summary).font(.subheadline).foregroundStyle(.secondary)
+                            } else if let played = entry.lastPlayed {
                                 Text("Last played \(played.formatted(.relative(presentation: .named)))").font(.subheadline).foregroundStyle(.secondary)
                             }
                             Button(action: start) { HStack(spacing: 10) { Image(systemName: "play.fill"); Text("Play").fontWeight(.semibold) }.frame(minWidth: 100, minHeight: 30) }
@@ -1522,7 +1805,7 @@ struct LibraryDetail: View {
                         }
                     }.padding(.vertical, 24)
                         .listRowBackground(
-                            LibraryArtwork(entry: entry, backdrop: true).blur(radius: 4)
+                            artwork(backdrop: true).blur(radius: 4)
                                 .overlay(Color(uiColor: .secondarySystemGroupedBackground).opacity(0.48))
                                 .overlay(alignment: .bottom) {
                                     LinearGradient(colors: [.clear, Color(uiColor: .secondarySystemGroupedBackground)], startPoint: .top, endPoint: .bottom).frame(height: 70)
@@ -1531,9 +1814,14 @@ struct LibraryDetail: View {
                 }
                 if entry.desktop != true { Section("Library details") {
                     TextField("Title", text: $entry.title)
+                    Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
                     Button("Choose cover image", systemImage: "photo") { importCover = true }
-                    if entry.coverFile != nil { Button("Remove cover image") { entry.coverFile = nil } }
+                    if entry.coverFile != nil { Button((entry.steamAppID ?? entry.steamID) != nil ? "Use Steam artwork" : "Remove cover image") { entry.coverFile = nil } }
                 } }
+                // How a Steam game starts sits under its library details (SteamGames.swift).
+                if entry.steamAppID != nil {
+                    SteamEntrySection(entry: $entry) { leaving = true; dismiss() }
+                }
                 Section("Display") {
                     // The Windows screen the game renders for (and the Desktop's size).
                     Picker("Resolution", selection: $entry.resolution) {
@@ -1551,11 +1839,33 @@ struct LibraryDetail: View {
                 }
                 Section {
                     Toggle("Reduced-precision x87", isOn: $entry.reducedX87)
-                    if entry.desktop != true {
+                    // Exported for this game only when chosen (applyEnvironment).
+                    Picker("CPU cores reported", selection: Binding(get: { entry.cpuCount ?? 0 }, set: { entry.cpuCount = $0 == 0 ? nil : $0 })) {
+                        Text("Automatic").tag(0)
+                        ForEach([1, 2, 4, 6], id: \.self) { Text("\($0)").tag($0) }
+                    }
+                    Picker("D3D9 anisotropic filtering", selection: Binding(get: { entry.anisotropyLimit ?? 0 }, set: { entry.anisotropyLimit = $0 == 0 ? nil : $0 })) {
+                        Text("Application default").tag(0)
+                        ForEach([1, 2, 4, 8], id: \.self) { Text("Up to \($0)×").tag($0) }
+                    }
+                    // Fastsync-only switches: shown for every game, usable only while
+                    // Settings › Sync engine is Fastsync.
+                    Group {
+                        Toggle("Fast synchronization", isOn: Binding(get: { entry.fastSync ?? true }, set: { entry.fastSync = $0 }))
+                        Toggle("Fast semaphore waits (experimental)",
+                               isOn: Binding(get: { entry.semaphoreFastPath ?? false }, set: { entry.semaphoreFastPath = $0 }))
+                    }
+                    .disabled(syncEngine != .fastsync)
+                    if syncEngine != .fastsync {
+                        Text("Fast synchronization and fast semaphore waits are Fastsync options. Choose Fastsync in Settings › Memory & sync to use them.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // A Steam game starts with Steam's own launch option through Madeira Dock.
+                    if entry.desktop != true && entry.steamAppID == nil {
                         TextField("Launch arguments", text: $entry.arguments, axis: .vertical).autocorrectionDisabled().textInputAutocapitalization(.never)
                     }
                 } header: { Text("Compatibility & performance") } footer: {
-                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. Settings apply to the next launch; a precision change may still require restarting Madeira.")
+                    Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
                 }
                 Section("On screen") {
                     Toggle("Performance overlay", isOn: $entry.performance)
@@ -1569,7 +1879,18 @@ struct LibraryDetail: View {
                     }
                     Text("Arrange buttons and choose XInput, mouse, or keyboard actions from the in-game menu.").font(.caption).foregroundStyle(.secondary)
                 }
-                if entry.desktop != true {
+                if entry.steamAppID != nil {
+                    Section {
+                        Text(entry.launchWindowsPath).font(.caption.monospaced()).textSelection(.enabled)
+                        if entry.startsSteamGameDirectly, !entry.launchArguments.isEmpty {
+                            Text(entry.launchArguments).font(.caption.monospaced()).textSelection(.enabled)
+                        }
+                    } header: { Text("Executable") } footer: {
+                        Text(entry.startsSteamGameDirectly
+                             ? "The game starts this program directly, without Steam."
+                             : "Valve's client starts the game's default Steam launch option from this folder.")
+                    }
+                } else if entry.desktop != true {
                     Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
                     Section { Button("Remove from library", role: .destructive) { remove = true } }
                 }
@@ -1579,6 +1900,7 @@ struct LibraryDetail: View {
             .toolbarBackground(.regularMaterial, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { model.save(entry); dismiss() } } }
+            .sheet(isPresented: $findCover) { SteamSearchView(query: entry.title) { match in entry.steamID = match.id; entry.title = match.name; entry.coverFile = nil } }
             .fileImporter(isPresented: $importCover, allowedContentTypes: [.image]) { result in
                 do {
                     let url = try result.get(); let access = url.startAccessingSecurityScopedResource(); defer { if access { url.stopAccessingSecurityScopedResource() } }
@@ -1601,9 +1923,48 @@ struct LibraryDetail: View {
             }
             .onDisappear { if !leaving { model.save(entry) } }
             .onReceive(LibraryController.shared.commands) { command in
-                guard !leaving, !importCover, !remove else { return }
+                guard !leaving, !findCover, !importCover, !remove else { return }
                 if command == "back" { model.save(entry); dismiss() }
                 if command == "accept" { start() }
+            }
+        }
+    }
+}
+
+/// Game details › Find on Steam: searches the public store by title; choosing
+/// a result gives the entry that app's name and store artwork.
+struct SteamSearchView: View {
+    @State var query: String
+    var select: (SteamMatch) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var results: [SteamMatch] = []
+    @State private var error: String?
+    @State private var loading = false
+    @State private var submitted = ""
+    var body: some View {
+        NavigationStack {
+            List {
+                if loading { ProgressView("Searching Steam…") }
+                if let error { Text(error).foregroundStyle(.secondary) }
+                ForEach(results) { match in
+                    Button { select(match); dismiss() } label: {
+                        HStack {
+                            AsyncImage(url: URL(string: match.tiny_image ?? "")) { $0.resizable().scaledToFit() } placeholder: { Image(systemName: "gamecontroller") }.frame(width: 70, height: 40)
+                            Text(match.name).foregroundStyle(.primary)
+                        }
+                    }
+                }
+            }.navigationTitle("Find on Steam")
+            .searchable(text: $query, prompt: "Title").onSubmit(of: .search) { submitted = query }
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .onAppear { submitted = query }
+            .task(id: submitted) {
+                guard !submitted.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                loading = true; error = nil
+                do { let found = try await SteamCatalog.search(submitted); try Task.checkCancellation(); results = found; if found.isEmpty { error = "No matches. Try a different title." } }
+                catch is CancellationError { return }
+                catch { self.error = error.localizedDescription }
+                loading = false
             }
         }
     }
@@ -1662,7 +2023,7 @@ struct MadeiraCredit: View {
 /// Settings › Memory & sync: the JIT pool (madeira.cfg pool), the video memory
 /// budget (vram-mb), the file-backed swap tier (swap-mb, off by default, and
 /// env.MADEIRA_SWAP_COVERAGE, which allocations it backs) and the in-process sync
-/// engine madsync (inproc-sync, on by default). All are read when Madeira starts,
+/// engine (SyncEngine: fastsync by default, madsync or Wine's own). All are read when Madeira starts,
 /// so changes apply after a restart. "All settings" opens every other option.
 /// MADEIRA_RUNTIME_SETTINGS=0 hides this section.
 /// A sheet opened from Settings; LibraryView presents it from the Form itself.
@@ -1671,13 +2032,47 @@ enum SettingsSheet: String, Identifiable {
     var id: String { rawValue }
 }
 
+/// The in-process synchronisation engine, one per session. Fastsync is the default:
+/// madeira.cfg with neither inproc-sync nor env.MADEIRA_FASTSYNC, for which the app
+/// exports MADEIRA_FASTSYNC=auto (WineProcessBridge.m). Madsync is inproc-sync = 1;
+/// Wine standard sync is inproc-sync = 0 without a fastsync value, as it was written
+/// while madsync was the default. Mirrors madeira_cfg_sync_engine (build/madeira_cfg.h).
+/// Wine reads both once per app run, and never runs fastsync while madsync is on.
+enum SyncEngine: String, CaseIterable, Identifiable {
+    case madsync, fastsync, wine
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .madsync: return "Madsync"
+        case .fastsync: return "Fastsync (default)"
+        case .wine: return "Wine standard sync"
+        }
+    }
+    /// The MADEIRA_FASTSYNC values Wine treats as "fastsync on" (sync.c, event.c).
+    static let fastsyncValues: Set<String> = ["1", "on", "yes", "auto", "cells"]
+    static var current: SyncEngine {
+        let inproc = MadeiraConfig.get("inproc-sync")
+        if inproc != nil && MadeiraConfig.bool("inproc-sync", default: false) { return .madsync }
+        if let fast = MadeiraConfig.get("env.MADEIRA_FASTSYNC") { return fastsyncValues.contains(fast) ? .fastsync : .wine }
+        return inproc == nil ? .fastsync : .wine
+    }
+    static func apply(_ engine: SyncEngine) {
+        switch engine {
+        case .madsync: MadeiraConfig.set("inproc-sync", "1"); MadeiraConfig.set("env.MADEIRA_FASTSYNC", nil)
+        case .fastsync: MadeiraConfig.set("inproc-sync", nil); MadeiraConfig.set("env.MADEIRA_FASTSYNC", nil)
+        case .wine: MadeiraConfig.set("inproc-sync", "0"); MadeiraConfig.set("env.MADEIRA_FASTSYNC", nil)
+        }
+    }
+}
+
 struct RuntimeMemorySyncSettings: View {
     /// Opens a Settings sheet (LibraryView owns the presentation).
     var open: (SettingsSheet) -> Void = { _ in }
     /// Bumped when a Settings sheet closes, so the rows re-read madeira.cfg.
     var refresh = 0
     /// The keys this section owns; All settings leaves them out.
-    static let featuredKeys: Set<String> = ["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync", "eco"]
+    static let featuredKeys: Set<String> = ["pool", "vram-mb", "swap-mb", "env.MADEIRA_SWAP_COVERAGE", "inproc-sync",
+                                            "env.MADEIRA_FASTSYNC", "eco"]
     static let poolChoices = [0, 512, 640, 768, 1024, 1152]          // 0 = the standard 896 MB
     static let vramChoices = [0, 1536, 2048, 3072, 4096, 4352, 4608, 5120, 6144]   // 0 = automatic
     static let swapChoices = [0, 1024, 2048, 3072, 4096]
@@ -1689,7 +2084,7 @@ struct RuntimeMemorySyncSettings: View {
     @State private var vramMB = Self.intKey("vram-mb")
     @State private var swapMB = Self.intKey("swap-mb")
     @State private var coverage = Self.currentCoverage()
-    @State private var madsync = MadeiraConfig.bool("inproc-sync", default: true)
+    @State private var engine = SyncEngine.current
     @State private var eco = MadeiraConfig.bool("eco", default: false)
     @State private var changed = false
 
@@ -1732,11 +2127,13 @@ struct RuntimeMemorySyncSettings: View {
                 if !Self.coverageChoices.contains(where: { $0.0 == coverage }) { Text(coverage).tag(coverage) }
             }
             .disabled(swapMB == 0)
-            Toggle("Madsync", isOn: Binding(get: { madsync }, set: { on in
-                madsync = on; changed = true
-                MadeiraConfig.set("inproc-sync", on ? nil : "0")
-                LogStore.shared.log("[runtime-settings] inproc-sync=\(on ? 1 : 0)")
-            }))
+            Picker("Sync engine", selection: Binding(get: { engine }, set: { choice in
+                engine = choice; changed = true
+                SyncEngine.apply(choice)
+                LogStore.shared.log("[runtime-settings] sync-engine=\(choice.rawValue)")
+            })) {
+                ForEach(SyncEngine.allCases) { Text($0.label).tag($0) }
+            }
             Toggle("Eco mode", isOn: Binding(get: { eco }, set: { on in
                 eco = on; changed = true
                 MadeiraConfig.set("eco", on ? "1" : nil)
@@ -1750,14 +2147,14 @@ struct RuntimeMemorySyncSettings: View {
                 Text("JIT pool is the memory reserved at launch for translated x86 code (256 to 1152 MB).")
                 Text("Video memory is how much graphics memory games are told they have. Automatic sizes it from the memory free at launch. Too high can get Madeira closed for using too much memory; too low makes games keep reloading textures.")
                 Text("Swap tier moves game data to a file on this device's storage when memory runs short, up to the chosen size, at some speed cost. Coverage decides which allocations it moves: large ones only (8 MB and up, the default), every allocation of 1 MB and up, or those plus allocations that overflow the game's address range. Wider coverage saves more memory but can slow a game down.")
-                Text("Madsync is the in-process synchronisation engine (on by default).")
+                Text("Sync engine: Fastsync (the default) handles events and semaphores in-process; its per-game options are in each game's details. Madsync is the older in-process engine. Wine standard sync uses neither. Only one engine runs at a time.")
                 Text("Eco mode starts every game with its threads at a low priority, which saves power but makes games run slower. Off by default. It is meant for loading screens: the ECO pill in the performance overlay turns it on and off while a game runs.")
                 if changed { Text("Restart Madeira (close it from the app switcher) for these changes to apply.").foregroundStyle(.orange) }
             }
         }
         .onChange(of: refresh) { _, _ in
             poolMB = Self.intKey("pool"); vramMB = Self.intKey("vram-mb"); swapMB = Self.intKey("swap-mb")
-            coverage = Self.currentCoverage(); madsync = MadeiraConfig.bool("inproc-sync", default: true)
+            coverage = Self.currentCoverage(); engine = SyncEngine.current
             eco = MadeiraConfig.bool("eco", default: false)
         }
     }
@@ -1875,6 +2272,8 @@ struct LibraryHUD: View {
     }
     @ObservedObject private var model = LibraryModel.shared
     @ObservedObject private var controls = TouchControlsModel.shared
+    /// A Madeira Dock start: its status, failure and Show desktop (DockStartScreen).
+    @ObservedObject private var dockStart = DockStartScreen.shared
     private let sessionTools = MadeiraConfig.flag("MADEIRA_SESSION_TOOLS")
     @State private var launchVisible = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1882,7 +2281,7 @@ struct LibraryHUD: View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 if model.launching, let entry = model.activeEntry {
-                    LibraryArtwork(entry: entry, backdrop: true).overlay(.black.opacity(0.65)).ignoresSafeArea()
+                    launchBackdrop(entry).overlay(.black.opacity(0.65)).ignoresSafeArea()
                         .opacity(launchVisible ? 1 : 0)
                     launchView(entry, geometry: geo)
                         .opacity(launchVisible ? 1 : 0)
@@ -1930,26 +2329,52 @@ struct LibraryHUD: View {
         VStack(spacing: 0) {
         ScrollView {
             VStack(spacing: compact ? 10 : 18) {
-                LibraryArtwork(entry: entry).frame(width: compact ? 90 : 120, height: compact ? 135 : 180)
+                launchCover(entry).frame(width: compact ? 90 : 120, height: compact ? 135 : 180)
                     .clipShape(RoundedRectangle(cornerRadius: 14)).shadow(radius: 20)
                 Text(entry.title).font(.title2.bold()).multilineTextAlignment(.center)
-                ProgressView().tint(.white)
-                TimelineView(.periodic(from: .now, by: 1)) { context in
-                    VStack(spacing: 8) {
-                        Text(model.launchSlow ? "Still starting…" : "Starting your game…").foregroundStyle(.white.opacity(0.7))
-                        Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
-                            .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
+                if dockStart.failure == nil { ProgressView().tint(.white) }
+                if let failure = dockStart.failure {
+                    Text("Madeira Dock stopped").font(.headline)
+                    Text(failure).font(.caption).multilineTextAlignment(.center).frame(maxWidth: 360)
+                } else if dockStart.active {
+                    // What the Dock start is waiting for, from the host's report, and what it
+                    // does with the game's one-time installs.
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        VStack(spacing: 8) {
+                            Text(dockStatus).foregroundStyle(.white.opacity(0.8)).multilineTextAlignment(.center)
+                            if let note = DockInstallers.note {
+                                Text(note).font(.caption).foregroundStyle(.white.opacity(0.6)).multilineTextAlignment(.center).frame(maxWidth: 360)
+                            }
+                            Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
+                                .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
+                        }
+                    }
+                } else {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        VStack(spacing: 8) {
+                            Text(model.launchSlow ? "Still starting…" : "Starting your game…").foregroundStyle(.white.opacity(0.7))
+                            Text("\(Int(context.date.timeIntervalSince(model.launchStartedAt)))s")
+                                .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.4))
+                        }
                     }
                 }
                 // The starting screen's controls are one row of glyph-only buttons, so a
                 // short screen does not push them below the fold. The words stay as
-                // VoiceOver labels.
+                // VoiceOver labels. A stopped Dock start can be closed; while a Dock start
+                // holds the desktop back, Show desktop reveals it.
                 HStack(spacing: 14) {
+                    if dockStart.failure != nil {
+                        launchGlyph("Close session", "stop.circle") { model.requestQuit() }
+                    }
                     launchGlyph(showLogs ? "Hide live log" : "Show live log", "text.alignleft", on: showLogs) {
                         model.toggleLaunchLogs()
                     }
+                    if dockStart.holding {
+                        launchGlyph("Show desktop", "macwindow") { dockStart.showDesktop(model) }
+                            .accessibilityHint("Shows the Windows desktop")
+                    }
                 }
-                if model.launchSlow {
+                if model.launchSlow && !dockStart.holding {
                     Button("Show game view") { model.showGameView(reason: "button") }.frame(minHeight: 44)
                 }
                 if showLogs && !sideLogs {
@@ -1977,6 +2402,27 @@ struct LibraryHUD: View {
         }
         .buttonStyle(.plain).foregroundStyle(.white)
         .accessibilityLabel(label)
+    }
+
+    /// The starting screen's cover and backdrop: a Dock start shows the game's
+    /// Steam artwork by App ID, any other session its library artwork.
+    @ViewBuilder private func launchCover(_ entry: LibraryEntry) -> some View {
+        if let appID = dockStart.appID { SteamGameArtwork(appID: appID) } else { LibraryArtwork(entry: entry) }
+    }
+    @ViewBuilder private func launchBackdrop(_ entry: LibraryEntry) -> some View {
+        if let appID = dockStart.appID { SteamLaunchBackdrop(appID: appID) } else { LibraryArtwork(entry: entry, backdrop: true) }
+    }
+
+    /// What the Dock start is doing (DockStartStatus), read once a second.
+    private var dockStatus: String {
+        MainActor.assumeIsolated {
+            let progress = DockInstallers.poll(drive: MadeiraDock.drive)
+            // The host starts at once, or after this start's one-time installs finished.
+            let hostDue = DockInstallers.finishedAt ?? model.launchStartedAt
+            return DockStartStatus.text(MadeiraDock.pollReport().fields, installers: DockInstallers.script != nil,
+                                        installerProgress: progress, installsFinished: DockInstallers.finishedAt != nil,
+                                        waited: Date().timeIntervalSince(hostDue))
+        }
     }
 
     private var menu: some View {
